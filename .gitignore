@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+work/
+outputs/
+dist/
+build/
+*.spec
+installer/LumaFetch.exe
+installer/*.sed
+%CD%/
+
