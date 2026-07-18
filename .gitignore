@@ -6,6 +6,7 @@ outputs/
 dist/
 build/
 *.spec
+!LumaFetch.spec
 installer/LumaFetch.exe
 installer/*.sed
 %CD%/

@@ -1,5 +1,5 @@
 #define MyAppName "Luma Fetch"
-#define MyAppVersion "1.9.2"
+#define MyAppVersion "1.9.3"
 #define MyAppPublisher "Luma Fetch"
 #define MyAppExeName "LumaFetch.exe"
 
@@ -9,13 +9,13 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 SetupIconFile=LumaFetch.ico
-VersionInfoVersion=1.9.2.0
-VersionInfoProductVersion=1.9.2.0
+VersionInfoVersion=1.9.3.0
+VersionInfoProductVersion=1.9.3.0
 DefaultDirName={localappdata}\Programs\LumaFetch
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\outputs
-OutputBaseFilename=LumaFetch-Setup-1.9.2
+OutputBaseFilename=LumaFetch-Setup-1.9.3
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -34,7 +34,7 @@ Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 Name: "desktopicon"; Description: "바탕 화면에 바로가기 만들기"; GroupDescription: "추가 바로가기:"
 
 [Files]
-Source: "LumaFetch.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\work\dist\LumaFetch\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0
@@ -48,8 +48,8 @@ var
 begin
   { Restart Manager sends the normal close request first.  This is a fallback
     for a frozen PyInstaller parent/child process that no longer has a window. }
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM "{#MyAppExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(400);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "{#MyAppExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(1200);
   Result := '';
 end;
 
