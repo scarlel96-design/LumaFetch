@@ -1,5 +1,5 @@
 #define MyAppName "Luma Fetch"
-#define MyAppVersion "1.3.0"
+#define MyAppVersion "1.9.1"
 #define MyAppPublisher "Luma Fetch"
 #define MyAppExeName "LumaFetch.exe"
 
@@ -9,13 +9,13 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 SetupIconFile=LumaFetch.ico
-VersionInfoVersion=1.3.0.0
-VersionInfoProductVersion=1.3.0.0
+VersionInfoVersion=1.9.1.0
+VersionInfoProductVersion=1.9.1.0
 DefaultDirName={localappdata}\Programs\LumaFetch
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\outputs
-OutputBaseFilename=LumaFetch-Setup-1.3.0
+OutputBaseFilename=LumaFetch-Setup-1.9.1
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -23,6 +23,9 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\{#MyAppExeName}
+CloseApplications=yes
+CloseApplicationsFilter={#MyAppExeName}
+RestartApplications=no
 
 [Languages]
 Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
@@ -37,3 +40,18 @@ Source: "LumaFetch.exe"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0; Tasks: desktopicon
 
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  { Restart Manager sends the normal close request first.  This is a fallback
+    for a frozen PyInstaller parent/child process that no longer has a window. }
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM "{#MyAppExeName}"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(400);
+  Result := '';
+end;
+
+[Run]
+Filename: "{app}\{#MyAppExeName}"; Description: "Luma Fetch 실행"; Flags: nowait postinstall skipifsilent
