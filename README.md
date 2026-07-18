@@ -11,7 +11,8 @@ Luma Fetch is a Windows desktop batch downloader for image URLs that follow a pr
 - Large original-image viewer with mouse selection and Left/Right keyboard navigation
 - Off-thread thumbnail decoding, bounded queues, disk-backed preview cache, and automatic cache cleanup
 - Optional Referer header support for hosts that restrict cross-site images
-- GitHub Releases update checks with in-app installer download and SHA-256 verification
+- GitHub Releases updates with in-app download, SHA-256 verification, silent installation, and automatic restart
+- Installer prerequisite detection with opt-in Microsoft VC++ Runtime installation from a pinned official HTTPS package
 - Optional character subfolders, retry handling, cancellation, progress, and error summaries
 - HTTPS/public-network/image-type validation and bounded download size
 - Optional Microsoft Defender scan request
@@ -44,8 +45,7 @@ Install PyInstaller and Inno Setup 6, then run from PowerShell:
 
 ```powershell
 pip install pyinstaller
-pyinstaller --noconfirm --clean --onefile --windowed --name LumaFetch --icon installer\LumaFetch.ico --add-data "installer\LumaFetch.ico;." app.py
-Copy-Item dist\LumaFetch.exe installer\LumaFetch.exe -Force
+pyinstaller --noconfirm --clean --distpath work\dist --workpath work\pyinstaller-build313 LumaFetch.spec
 ISCC installer\LumaFetch.iss
 ```
 
@@ -56,6 +56,8 @@ The generated installer is placed in `outputs/` by the Inno Setup script. Build 
 - The app accepts only public HTTPS image URLs with approved image extensions.
 - It checks response MIME type, basic image signatures, and a 30 MiB maximum file size.
 - The updater accepts only the versioned installer asset from this repository's GitHub Release, requires GitHub's SHA-256 asset digest, verifies size and hash, and only then starts the installer.
+- Updates are handed to Inno Setup with no separate wizard, then Luma Fetch is relaunched with an update-complete marker.
+- Missing prerequisites are detected before installation. The VC++ package uses a versioned Microsoft HTTPS URL and a pinned SHA-256 hash; a mismatch aborts installation.
 - Release binaries should be published with a SHA-256 hash. A third-party detection result is not, by itself, a proof that a file is safe or malicious.
 - Do not use the app to download content without permission from its owner or host.
 

@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.9.3"
+APP_VERSION = "1.10.0"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -274,6 +274,24 @@ def is_trusted_asset_response(value: str) -> bool:
     return parsed.scheme == "https" and (
         hostname == "github.com" or hostname == "release-assets.githubusercontent.com"
     )
+
+
+def build_update_installer_command(installer: Path, *, restart: bool) -> list[str]:
+    """Build a verified, non-interactive Inno Setup update handoff."""
+    if sys.platform != "win32" or not installer.is_file() or installer.suffix.lower() != ".exe":
+        raise RuntimeError("검증된 Windows 설치 파일을 찾을 수 없습니다.")
+    command = [
+        str(installer),
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/CLOSEAPPLICATIONS",
+        "/FORCECLOSEAPPLICATIONS",
+        "/LUMAFETCHUPDATE",
+    ]
+    if restart:
+        command.append("/AUTORESTARTAPP")
+    return command
 
 
 async def fetch_latest_release() -> UpdateInfo:
@@ -944,6 +962,9 @@ class DownloaderApp(ctk.CTk):
         self.viewer_photo: tk.PhotoImage | None = None
         self.update_checking = False
         self._build()
+        if "--update-complete" in sys.argv:
+            self.update_status.configure(text=f"v{APP_VERSION} 업데이트 완료", text_color=self.COLORS["success"])
+            self.after(250, lambda: self._write_log(f"업데이트 완료 — Luma Fetch v{APP_VERSION}"))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(35, self._poll_events)
 
@@ -1106,7 +1127,7 @@ class DownloaderApp(ctk.CTk):
                 dialog.destroy()
         self.update_dialog = ctk.CTkToplevel(self)
         self.update_dialog.title("Luma Fetch — 새 업데이트")
-        self.update_dialog.geometry("540x470")
+        self.update_dialog.geometry("540x540")
         self.update_dialog.resizable(False, False)
         self.update_dialog.configure(fg_color=self.COLORS["bg"])
         self.update_dialog.transient(self)
@@ -1122,12 +1143,27 @@ class DownloaderApp(ctk.CTk):
             font=self._font(12), text_color=self.COLORS["muted"], justify="left",
         ).pack(anchor="w", padx=24, pady=(0, 14))
         notes = ctk.CTkTextbox(
-            self.update_dialog, height=180, corner_radius=14,
+            self.update_dialog, height=150, corner_radius=14,
             fg_color=self.COLORS["input"], font=self._font(11), text_color="#C9D4F3",
         )
         notes.pack(fill="both", expand=True, padx=24, pady=(0, 12))
         notes.insert("1.0", info.notes or "자세한 변경 사항은 GitHub 릴리스 페이지에서 확인할 수 있습니다.")
         notes.configure(state="disabled")
+        self.update_phase_label = ctk.CTkLabel(
+            self.update_dialog,
+            text="1 다운로드  →  2 보안 검증  →  3 자동 설치",
+            font=self._font(10, "bold"), text_color="#AAB7D8",
+        )
+        self.update_phase_label.pack(anchor="w", padx=24, pady=(0, 8))
+        self.update_relaunch_var = ctk.BooleanVar(value=True)
+        self.update_relaunch_checkbox = ctk.CTkCheckBox(
+            self.update_dialog,
+            text="설치 완료 후 Luma Fetch 자동 재실행",
+            variable=self.update_relaunch_var,
+            checkbox_width=17, checkbox_height=17,
+            font=self._font(10), text_color="#C9D4F3",
+        )
+        self.update_relaunch_checkbox.pack(anchor="w", padx=24, pady=(0, 10))
         self.update_download_progress = ctk.CTkProgressBar(
             self.update_dialog, height=10, corner_radius=8,
             fg_color="#25304B", progress_color=self.COLORS["accent"],
@@ -1136,7 +1172,7 @@ class DownloaderApp(ctk.CTk):
         self.update_download_progress.pack(fill="x", padx=24, pady=(0, 5))
         self.update_download_label = ctk.CTkLabel(
             self.update_dialog,
-            text=f"설치 파일 {info.asset_size / (1024 * 1024):.1f} MiB · SHA-256 검증 후 실행",
+            text=f"설치 파일 {info.asset_size / (1024 * 1024):.1f} MiB · 검증 후 앱 안에서 자동 설치",
             font=self._font(10), text_color=self.COLORS["muted"],
         )
         self.update_download_label.pack(anchor="w", padx=24, pady=(0, 12))
@@ -1148,7 +1184,7 @@ class DownloaderApp(ctk.CTk):
         )
         self.update_cancel_button.pack(side="right")
         self.update_install_button = ctk.CTkButton(
-            actions, text="다운로드 후 설치", width=160, height=36, corner_radius=12,
+            actions, text="지금 업데이트", width=145, height=36, corner_radius=12,
             fg_color=self.COLORS["accent"], hover_color=self.COLORS["accent_hover"],
             command=lambda: self._download_and_install_update(info),
         )
@@ -1162,9 +1198,16 @@ class DownloaderApp(ctk.CTk):
 
     def _download_and_install_update(self, info: UpdateInfo) -> None:
         self.update_download_cancel = threading.Event()
-        self.update_install_button.configure(state="disabled", text="다운로드 중…")
-        self.update_cancel_button.configure(text="취소")
-        self.update_download_label.configure(text="GitHub에서 설치 파일을 다운로드하는 중…")
+        self.update_install_button.configure(state="disabled", text="업데이트 진행 중…")
+        self.update_cancel_button.configure(state="normal", text="취소")
+        self.update_relaunch_checkbox.configure(state="disabled")
+        self.update_phase_label.configure(
+            text="● 다운로드 중   ○ 보안 검증   ○ 자동 설치", text_color="#AAB7D8"
+        )
+        self.update_download_label.configure(
+            text="GitHub에서 설치 파일을 다운로드하는 중…", text_color=self.COLORS["muted"]
+        )
+        self.update_dialog.protocol("WM_DELETE_WINDOW", self._cancel_update_download)
         threading.Thread(target=self._download_update_worker, args=(info,), daemon=True).start()
 
     def _download_update_worker(self, info: UpdateInfo) -> None:
@@ -1198,30 +1241,40 @@ class DownloaderApp(ctk.CTk):
         self.update_status.configure(text="업데이트 설치 실패", text_color=self.COLORS["danger"])
         self._write_log(f"업데이트 설치 실패: {message}")
         if getattr(self, "update_dialog", None) and self.update_dialog.winfo_exists():
-            self.update_install_button.configure(state="normal", text="다시 다운로드")
-            self.update_cancel_button.configure(text="닫기")
+            self.update_install_button.configure(state="normal", text="다시 시도")
+            self.update_cancel_button.configure(state="normal", text="닫기")
+            self.update_relaunch_checkbox.configure(state="normal")
+            self.update_phase_label.configure(text="업데이트 중단 · 다시 시도할 수 있습니다.", text_color=self.COLORS["danger"])
             self.update_download_label.configure(text=message, text_color=self.COLORS["danger"])
+            self.update_dialog.protocol("WM_DELETE_WINDOW", self._cancel_update_download)
 
     def _handle_update_download_done(self, installer: Path) -> None:
+        restart = True
         if getattr(self, "update_dialog", None) and self.update_dialog.winfo_exists():
+            restart = bool(self.update_relaunch_var.get())
             self.update_download_progress.set(1)
-            self.update_download_label.configure(text="SHA-256 검증 완료 · 설치 프로그램을 시작합니다.")
-        self.update_status.configure(text="업데이트 설치 시작", text_color=self.COLORS["success"])
-        self.after(350, lambda: self._launch_update_installer(installer))
-
-    def _launch_update_installer(self, installer: Path) -> None:
-        try:
-            if sys.platform != "win32" or not installer.is_file() or installer.suffix.lower() != ".exe":
-                raise RuntimeError("검증된 Windows 설치 파일을 찾을 수 없습니다.")
-            subprocess.Popen(
-                [str(installer), "/SP-", "/CLOSEAPPLICATIONS"],
-                close_fds=True,
-                creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            self.update_phase_label.configure(
+                text="✓ 다운로드 완료   ✓ SHA-256 검증   ● 자동 설치 준비",
+                text_color=self.COLORS["success"],
             )
+            self.update_download_label.configure(text="보안 검증 완료 · 앱을 종료하고 자동 설치합니다.")
+            self.update_cancel_button.configure(state="disabled", text="설치 준비")
+            self.update_dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.update_status.configure(text="업데이트 자동 설치 준비", text_color=self.COLORS["success"])
+        self.after(500, lambda: self._launch_update_installer(installer, restart=restart))
+
+    def _launch_update_installer(self, installer: Path, *, restart: bool) -> None:
+        try:
+            command = build_update_installer_command(installer, restart=restart)
+            creationflags = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+            )
+            subprocess.Popen(command, close_fds=True, creationflags=creationflags)
         except Exception as error:
             self._handle_update_download_error(str(error))
             return
-        self.after(500, self._on_close)
+        self.after(150, self._on_close)
 
     def _open_release_page(self, release_url: str) -> None:
         if not is_trusted_release_url(release_url):
