@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.9.2"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -1009,12 +1009,22 @@ class DownloaderApp(ctk.CTk):
         self._entry(form, "동시 다운로드", "공란 = 20", 2, 1)
         self._entry(form, "Referer", "필요 시 원본 페이지 주소", 3, 0, span=2)
         preview_row = ctk.CTkFrame(form, fg_color="transparent")
-        preview_row.grid(row=4, column=0, columnspan=2, padx=18, pady=(3, 12), sticky="ew")
-        preview_row.grid_columnconfigure(1, weight=1)
-        self.preview_image_label = ctk.CTkLabel(preview_row, text="▧", width=70, height=70, corner_radius=12, fg_color=self.COLORS["input"], text_color="#566486", font=self._font(22))
-        self.preview_image_label.grid(row=0, column=0, sticky="w")
+        preview_row.grid(row=4, column=0, columnspan=2, padx=18, pady=(4, 2), sticky="ew")
+        preview_row.grid_columnconfigure(0, weight=1)
         self.preview = ctk.CTkLabel(preview_row, text="설정을 입력한 뒤 미리보기 버튼을 누르세요.", text_color="#AAB7D8", font=self._font(10), justify="left", wraplength=680)
-        self.preview.grid(row=0, column=1, padx=(12, 0), sticky="w")
+        self.preview.grid(row=0, column=0, sticky="w")
+        input_help = (
+            "캐릭터 코드는 쉼표(,)로 구분하고, 상황 범위는 1..10 형식으로 입력하세요.\n"
+            "템플릿 URL에서 코드가 들어갈 위치는 캐릭터 · 의상 · 상황 키워드로 채우세요."
+        )
+        ctk.CTkLabel(
+            form,
+            text=input_help,
+            text_color="#7180A5",
+            font=self._font(9),
+            justify="left",
+            anchor="w",
+        ).grid(row=5, column=0, columnspan=2, padx=18, pady=(0, 12), sticky="ew")
 
         storage = self._card(main)
         storage.grid(row=2, column=0, sticky="ew", pady=10)
@@ -1248,7 +1258,6 @@ class DownloaderApp(ctk.CTk):
 
     def _clear_live_preview(self, message: str) -> None:
         self.preview_photo = None
-        self.preview_image_label.configure(image=None, text="▧")
         self.preview.configure(text=message)
 
     def _update_preview(self, _event: object | None = None) -> None:
@@ -1424,8 +1433,6 @@ class DownloaderApp(ctk.CTk):
             return
         self.gallery_items[index] = item
         self.virtual_gallery.add_item(index, item)
-        if self.gallery_loaded == 0:
-            self.preview_image_label.configure(image=None, text="✓")
         self.gallery_loaded += 1
         self.gallery_summary.configure(text=f"{item.character} · 수신 {self.gallery_loaded}장 · 전체 {self.gallery_total}장 요청 중")
         self.preview.configure(text=f"미리보기 수신 중 · {item.character} {self.gallery_loaded}장")

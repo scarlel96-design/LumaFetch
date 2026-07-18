@@ -1,5 +1,5 @@
 #define MyAppName "Luma Fetch"
-#define MyAppVersion "1.9.1"
+#define MyAppVersion "1.9.2"
 #define MyAppPublisher "Luma Fetch"
 #define MyAppExeName "LumaFetch.exe"
 
@@ -9,13 +9,13 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 SetupIconFile=LumaFetch.ico
-VersionInfoVersion=1.9.1.0
-VersionInfoProductVersion=1.9.1.0
+VersionInfoVersion=1.9.2.0
+VersionInfoProductVersion=1.9.2.0
 DefaultDirName={localappdata}\Programs\LumaFetch
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\outputs
-OutputBaseFilename=LumaFetch-Setup-1.9.1
+OutputBaseFilename=LumaFetch-Setup-1.9.2
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
