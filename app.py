@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.11.1"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -1080,6 +1080,7 @@ class DownloaderApp(ctk.CTk):
         self.entries: dict[str, ctk.CTkEntry] = {}
         self.entry_vars: dict[str, ctk.StringVar] = {}
         self.preview_after_id: str | None = None
+        self.favorite_preview_after_id: str | None = None
         self.preview_sequence = 0
         self.preview_photo: tk.PhotoImage | None = None
         self.preview_cancel_event = threading.Event()
@@ -1427,12 +1428,20 @@ class DownloaderApp(ctk.CTk):
         variable = ctk.StringVar(value=initial)
         entry = ctk.CTkEntry(holder, textvariable=variable, placeholder_text=placeholder, height=34, corner_radius=11, fg_color=self.COLORS["input"], border_color="#2A3655", font=self._font(11))
         entry.grid(row=1, column=0, sticky="ew")
-        entry.bind("<KeyRelease>", self._update_preview)
-        entry.bind("<FocusOut>", self._update_preview)
-        entry.bind("<<Paste>>", lambda _event: self.after(25, self._update_preview))
+        entry.bind("<KeyRelease>", self._queue_preview_update)
+        entry.bind("<FocusOut>", self._queue_preview_update)
+        entry.bind("<<Paste>>", lambda _event: self.after(25, self._queue_preview_update))
         self.entries[label] = entry
         self.entry_vars[label] = variable
-        variable.trace_add("write", lambda *_args: self.after_idle(self._update_preview))
+        variable.trace_add("write", lambda *_args: self.after_idle(self._queue_preview_update))
+
+    def _queue_preview_update(self, _event: object | None = None) -> None:
+        """Coalesce rapid field changes without cancelling a favorite preview being opened."""
+        if self.favorite_preview_after_id:
+            return
+        if self.preview_after_id:
+            self.after_cancel(self.preview_after_id)
+        self.preview_after_id = self.after(45, self._update_preview)
 
     def _preview_config(self) -> DownloadConfig:
         """Validate preview inputs without requiring a download destination."""
@@ -2062,6 +2071,16 @@ class DownloaderApp(ctk.CTk):
             self._write_log("다운로드 중에는 즐겨찾기 미리보기를 열 수 없습니다.")
             return
         self._apply_favorite(favorite)
+        if self.favorite_preview_after_id:
+            self.after_cancel(self.favorite_preview_after_id)
+        self.favorite_preview_after_id = self.after(120, self._start_favorite_preview)
+
+    def _start_favorite_preview(self) -> None:
+        """Start only after StringVar traces from applying the preset have drained."""
+        self.favorite_preview_after_id = None
+        if self.preview_after_id:
+            self.after_cancel(self.preview_after_id)
+            self.preview_after_id = None
         self._manual_preview()
 
     def _download_favorite(self, favorite: FavoritePreset) -> None:
@@ -2228,6 +2247,9 @@ class DownloaderApp(ctk.CTk):
         if self.preview_after_id:
             self.after_cancel(self.preview_after_id)
             self.preview_after_id = None
+        if self.favorite_preview_after_id:
+            self.after_cancel(self.favorite_preview_after_id)
+            self.favorite_preview_after_id = None
         if gallery := getattr(self, "preview_gallery", None):
             if gallery.winfo_exists():
                 gallery.destroy()
