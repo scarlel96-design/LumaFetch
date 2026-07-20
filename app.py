@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.12.2"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -1510,7 +1510,13 @@ class DownloaderApp(ctk.CTk):
     def _trace_preview_update(self) -> None:
         """Ignore programmatic favorite loads while preserving normal live validation."""
         if not self.preview_updates_suspended:
+            self._invalidate_preview_session()
             self._queue_preview_update()
+
+    def _invalidate_preview_session(self) -> None:
+        """Immediately disconnect every request associated with edited inputs."""
+        self.preview_sequence += 1
+        self.preview_cancel_event.set()
 
     def _cancel_preview_update(self) -> None:
         """Cancel the only tracked input invalidation before an explicit action."""
@@ -1543,10 +1549,29 @@ class DownloaderApp(ctk.CTk):
         self.preview_photo = None
         self.preview.configure(text=message)
 
+    @staticmethod
+    def _input_error_message(error: ValidationError | ValueError) -> str:
+        if isinstance(error, ValidationError) and (issues := error.errors(include_url=False)):
+            issue = issues[0]
+            field = str(issue.get("loc", ("입력",))[0])
+            label = {
+                "template_url": "템플릿 URL", "character": "캐릭터 코드",
+                "ranges": "상황 코드 범위", "outfit": "의상 코드",
+                "referer": "Referer", "concurrency": "동시 다운로드",
+                "destination": "저장 위치",
+            }.get(field, "입력값")
+            message = str(issue.get("msg", error)).removeprefix("Value error, ")
+            return f"{label}: {message}"
+        return str(error)
+
+    def _show_input_error(self, action: str, error: ValidationError | ValueError) -> None:
+        message = self._input_error_message(error)
+        self._clear_live_preview(f"{action} 불가 · {message}")
+        self.state_badge.configure(text="●  입력 확인", fg_color="#452536", text_color="#FF9CAD")
+        self._write_log(f"{action} 입력 오류: {message}")
+
     def _update_preview(self, _event: object | None = None) -> None:
-        """Never fetch automatically; invalidate an in-flight preview after input changes."""
-        self.preview_sequence += 1
-        self.preview_cancel_event.set()
+        """Refresh validation text after the request session was invalidated immediately."""
         self.preview_after_id = None
         try:
             self._preview_config()
@@ -1564,8 +1589,7 @@ class DownloaderApp(ctk.CTk):
         try:
             config = self._preview_config()
         except (ValidationError, ValueError) as error:
-            self._write_log(f"미리보기 입력 오류: {error}")
-            self._clear_live_preview("입력값을 확인한 뒤 다시 시도하세요.")
+            self._show_input_error("미리보기", error)
             return
         self.preview_sequence += 1
         sequence = self.preview_sequence
@@ -2108,7 +2132,7 @@ class DownloaderApp(ctk.CTk):
             if not 1 <= concurrency <= 50:
                 raise ValueError("동시 다운로드는 1~50 사이여야 합니다.")
         except (ValidationError, ValueError) as error:
-            self._write_log(f"즐겨찾기 저장 오류: {error}")
+            self._show_input_error("즐겨찾기 저장", error)
             return
         dialog = ctk.CTkInputDialog(text="즐겨찾기 이름을 입력하세요.", title="즐겨찾기 저장")
         if not (name := (dialog.get_input() or "").strip()):
@@ -2140,7 +2164,7 @@ class DownloaderApp(ctk.CTk):
                 destination=destination if fixed_destination else None,
             )
         except (ValidationError, ValueError) as error:
-            self._write_log(f"즐겨찾기 저장 오류: {error}")
+            self._show_input_error("즐겨찾기 저장", error)
             return
         existing = next((item for item in self.favorites if item.name.casefold() == preset.name.casefold()), None)
         if existing and not messagebox.askyesno("즐겨찾기 갱신", f"'{existing.name}' 설정을 덮어쓸까요?", parent=self):
@@ -2221,9 +2245,11 @@ class DownloaderApp(ctk.CTk):
 
     def _start(self) -> None:
         if self.running: return
-        try: config = self._config()
+        try:
+            config = self._config()
         except (ValidationError, ValueError) as error:
-            self._write_log(f"입력 오류: {error}"); self.state_badge.configure(text="●  확인 필요", fg_color="#452536", text_color="#FF9CAD"); return
+            self._show_input_error("다운로드", error)
+            return
         self.running, self.cancel_event = True, threading.Event()
         self.progress.set(0); self.log.delete("1.0", "end")
         self.start_button.configure(state="disabled"); self.preview_button.configure(state="disabled"); self.cancel_button.configure(state="normal")
