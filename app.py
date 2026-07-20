@@ -35,14 +35,15 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.11.1"
+APP_VERSION = "1.12.0"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
 MAX_RELEASE_METADATA_BYTES = 256 * 1024
 MAX_UPDATE_INSTALLER_BYTES = 150 * 1024 * 1024
 FAVORITES_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LumaFetch" / "favorites.json"
-MAX_FAVORITES = 50
+MAX_FAVORITES = 1000
+FAVORITES_PAGE_SIZE = 30
 def runtime_asset(name: str) -> Path:
     """Return a bundled PyInstaller asset or its source-tree equivalent."""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -1080,7 +1081,7 @@ class DownloaderApp(ctk.CTk):
         self.entries: dict[str, ctk.CTkEntry] = {}
         self.entry_vars: dict[str, ctk.StringVar] = {}
         self.preview_after_id: str | None = None
-        self.favorite_preview_after_id: str | None = None
+        self.preview_updates_suspended = False
         self.preview_sequence = 0
         self.preview_photo: tk.PhotoImage | None = None
         self.preview_cancel_event = threading.Event()
@@ -1113,17 +1114,22 @@ class DownloaderApp(ctk.CTk):
         sidebar.grid_propagate(False)
         ctk.CTkLabel(sidebar, text="LUMA", font=self._font(24, "bold"), text_color=self.COLORS["text"]).pack(anchor="w", padx=22, pady=(26, 0))
         ctk.CTkLabel(sidebar, text="FETCH", font=self._font(10, "bold"), text_color=self.COLORS["accent"]).pack(anchor="w", padx=24, pady=(0, 22))
-        nav = self._card(sidebar)
-        nav.configure(fg_color="#17213A", border_width=0)
+        nav = ctk.CTkFrame(sidebar, corner_radius=14, fg_color="#17213A")
         nav.pack(fill="x", padx=14)
-        ctk.CTkLabel(nav, text="↓  일괄 다운로드", font=self._font(11, "bold"), height=38, anchor="w").pack(fill="x", padx=12, pady=5)
+        self.download_nav_button = ctk.CTkButton(
+            nav, text="↓  일괄 다운로드", height=38, anchor="w", corner_radius=10,
+            fg_color=self.COLORS["accent"], hover_color=self.COLORS["accent_hover"],
+            font=self._font(11, "bold"), command=lambda: self._show_main_view("download"),
+        )
+        self.download_nav_button.pack(fill="x", padx=5, pady=(5, 2))
+        self.favorites_nav_button = ctk.CTkButton(
+            nav, text="★  즐겨찾기", height=38, anchor="w", corner_radius=10,
+            fg_color="transparent", hover_color="#273450",
+            font=self._font(11, "bold"), command=lambda: self._show_main_view("favorites"),
+        )
+        self.favorites_nav_button.pack(fill="x", padx=5, pady=(2, 5))
         ctk.CTkLabel(sidebar, text="ASYNC · RETRY · FAST", font=self._font(9, "bold"), text_color=self.COLORS["muted"]).pack(anchor="w", padx=22, pady=(28, 8))
-        ctk.CTkLabel(sidebar, text="여러 캐릭터와\n상황 범위를 한 번에 처리합니다.", justify="left", font=self._font(11), text_color=self.COLORS["muted"]).pack(anchor="w", padx=22)
-        favorites_title = ctk.CTkFrame(sidebar, fg_color="transparent")
-        favorites_title.pack(fill="x", padx=16, pady=(18, 4))
-        ctk.CTkLabel(favorites_title, text="★  즐겨찾기", font=self._font(11, "bold"), text_color="#DDE5FF").pack(side="left")
-        self.favorite_list = ctk.CTkScrollableFrame(sidebar, width=148, height=190, corner_radius=12, fg_color="#0D1528")
-        self.favorite_list.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        ctk.CTkLabel(sidebar, text="저장한 설정은 즐겨찾기 화면에서\n검색하고 바로 실행할 수 있습니다.", justify="left", font=self._font(10), text_color=self.COLORS["muted"]).pack(anchor="w", padx=22)
         self.version_label = ctk.CTkLabel(sidebar, text=f"v{APP_VERSION}", font=self._font(10), text_color="#5F6E92")
         self.version_label.pack(side="bottom", anchor="w", padx=22, pady=(8, 18))
         self.update_status = ctk.CTkLabel(sidebar, text="", font=self._font(9), text_color=self.COLORS["muted"], wraplength=140, justify="left")
@@ -1135,7 +1141,8 @@ class DownloaderApp(ctk.CTk):
         )
         self.update_button.pack(side="bottom", padx=16, pady=(20, 2))
 
-        main = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.download_view = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        main = self.download_view
         main.grid(row=0, column=1, sticky="nsew", padx=22, pady=16)
         main.grid_columnconfigure(0, weight=1)
 
@@ -1220,8 +1227,74 @@ class DownloaderApp(ctk.CTk):
         activity.grid_columnconfigure(0, weight=1); activity.grid_rowconfigure(0, weight=1)
         self.log = ctk.CTkTextbox(activity, corner_radius=14, fg_color=self.COLORS["input"], border_width=0, font=self._font(11), text_color="#B9C5E3")
         self.log.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        self._build_favorites_view()
+        self._render_favorites()
+        self._show_main_view("download")
+
+
+    def _build_favorites_view(self) -> None:
+        self.favorite_page = 0
+        self.favorite_render_after_id: str | None = None
+        self.favorites_view = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.favorites_view.grid(row=0, column=1, sticky="nsew", padx=22, pady=16)
+        self.favorites_view.grid_columnconfigure(0, weight=1)
+        self.favorites_view.grid_rowconfigure(2, weight=1)
+
+        header = ctk.CTkFrame(self.favorites_view, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(header, text="즐겨찾기", font=self._font(25, "bold"), text_color=self.COLORS["text"]).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(header, text="저장한 설정을 검색하고 미리보기 또는 다운로드를 바로 실행하세요.", font=self._font(12), text_color=self.COLORS["muted"]).grid(row=1, column=0, sticky="w")
+        self.favorite_count_label = ctk.CTkLabel(header, text="", font=self._font(11, "bold"), text_color="#AAB7D8")
+        self.favorite_count_label.grid(row=0, column=1, rowspan=2, sticky="e")
+
+        toolbar = self._card(self.favorites_view)
+        toolbar.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        toolbar.grid_columnconfigure(0, weight=1)
+        self.favorite_search_var = ctk.StringVar(value="")
+        search = ctk.CTkEntry(toolbar, textvariable=self.favorite_search_var, placeholder_text="이름 · 주소 · 캐릭터 코드 검색", height=38, corner_radius=12, fg_color=self.COLORS["input"], border_color="#2A3655", font=self._font(11))
+        search.grid(row=0, column=0, padx=(14, 8), pady=12, sticky="ew")
+        search.bind("<KeyRelease>", self._schedule_favorite_render)
+        ctk.CTkButton(toolbar, text="검색 지우기", width=82, height=34, corner_radius=11, fg_color="#273450", hover_color="#334364", command=lambda: self.favorite_search_var.set("")).grid(row=0, column=1, padx=(0, 14), pady=12)
+        self.favorite_prev_button = ctk.CTkButton(toolbar, text="‹", width=38, height=34, corner_radius=11, fg_color="#273450", hover_color="#334364", command=lambda: self._change_favorite_page(-1))
+        self.favorite_prev_button.grid(row=0, column=2, padx=(0, 5), pady=12)
+        self.favorite_page_label = ctk.CTkLabel(toolbar, text="1 / 1", width=66, font=self._font(10, "bold"), text_color="#AAB7D8")
+        self.favorite_page_label.grid(row=0, column=3, pady=12)
+        self.favorite_next_button = ctk.CTkButton(toolbar, text="›", width=38, height=34, corner_radius=11, fg_color="#273450", hover_color="#334364", command=lambda: self._change_favorite_page(1))
+        self.favorite_next_button.grid(row=0, column=4, padx=(5, 14), pady=12)
+        self.favorite_search_var.trace_add("write", lambda *_args: self._schedule_favorite_render())
+
+        self.favorite_grid = ctk.CTkScrollableFrame(self.favorites_view, corner_radius=18, fg_color="#0D1528")
+        self.favorite_grid.grid(row=2, column=0, sticky="nsew")
+        self.favorite_grid.grid_columnconfigure((0, 1), weight=1, uniform="favorite")
+        self.favorites_view.grid_remove()
+
+    def _show_main_view(self, view: str) -> None:
+        is_favorites = view == "favorites"
+        if is_favorites:
+            self.download_view.grid_remove()
+            self.favorites_view.grid()
+            self._render_favorites()
+        else:
+            self.favorites_view.grid_remove()
+            self.download_view.grid()
+        self.download_nav_button.configure(fg_color="transparent" if is_favorites else self.COLORS["accent"])
+        self.favorites_nav_button.configure(fg_color=self.COLORS["accent"] if is_favorites else "transparent")
+
+    def _schedule_favorite_render(self, _event: object | None = None) -> None:
+        self.favorite_page = 0
+        if self.favorite_render_after_id:
+            self.after_cancel(self.favorite_render_after_id)
+        self.favorite_render_after_id = self.after(90, self._render_favorites)
+
+    def _change_favorite_page(self, offset: int) -> None:
+        self.favorite_page = max(0, self.favorite_page + offset)
         self._render_favorites()
 
+    def _load_favorite_to_form(self, favorite: FavoritePreset) -> None:
+        self._apply_favorite(favorite)
+        self._show_main_view("download")
+        self._clear_live_preview("즐겨찾기 설정을 불러왔습니다. 미리보기 또는 다운로드를 누르세요.")
 
     def _check_for_updates(self) -> None:
         if self.update_checking:
@@ -1433,12 +1506,15 @@ class DownloaderApp(ctk.CTk):
         entry.bind("<<Paste>>", lambda _event: self.after(25, self._queue_preview_update))
         self.entries[label] = entry
         self.entry_vars[label] = variable
-        variable.trace_add("write", lambda *_args: self.after_idle(self._queue_preview_update))
+        variable.trace_add("write", lambda *_args: self._trace_preview_update())
+
+    def _trace_preview_update(self) -> None:
+        """Ignore programmatic favorite loads while preserving normal live validation."""
+        if not self.preview_updates_suspended:
+            self.after_idle(self._queue_preview_update)
 
     def _queue_preview_update(self, _event: object | None = None) -> None:
         """Coalesce rapid field changes without cancelling a favorite preview being opened."""
-        if self.favorite_preview_after_id:
-            return
         if self.preview_after_id:
             self.after_cancel(self.preview_after_id)
         self.preview_after_id = self.after(45, self._update_preview)
@@ -1950,45 +2026,49 @@ class DownloaderApp(ctk.CTk):
             )
         )
     def _render_favorites(self) -> None:
-        if not hasattr(self, "favorite_list"):
+        if not hasattr(self, "favorite_grid"):
             return
-        for child in self.favorite_list.winfo_children():
+        self.favorite_render_after_id = None
+        query = self.favorite_search_var.get().strip().casefold()
+        filtered = [
+            favorite for favorite in self.favorites
+            if not query or query in " ".join((
+                favorite.name, favorite.template_url, favorite.character,
+                favorite.ranges, favorite.referer or "",
+            )).casefold()
+        ]
+        page_count = max(1, (len(filtered) + FAVORITES_PAGE_SIZE - 1) // FAVORITES_PAGE_SIZE)
+        self.favorite_page = min(self.favorite_page, page_count - 1)
+        first = self.favorite_page * FAVORITES_PAGE_SIZE
+        visible = filtered[first:first + FAVORITES_PAGE_SIZE]
+        for child in self.favorite_grid.winfo_children():
             child.destroy()
-        if not self.favorites:
-            ctk.CTkLabel(
-                self.favorite_list, text="저장된 항목 없음", font=self._font(9),
-                text_color="#7180A5",
-            ).pack(padx=6, pady=12)
+        self.favorite_count_label.configure(text=f"전체 {len(self.favorites):,}개 · 검색 결과 {len(filtered):,}개")
+        self.favorite_page_label.configure(text=f"{self.favorite_page + 1} / {page_count}")
+        self.favorite_prev_button.configure(state="normal" if self.favorite_page > 0 else "disabled")
+        self.favorite_next_button.configure(state="normal" if self.favorite_page + 1 < page_count else "disabled")
+        self.favorites_nav_button.configure(text=f"★  즐겨찾기  {len(self.favorites):,}")
+        if not visible:
+            message = "검색 결과가 없습니다." if query else "저장된 즐겨찾기가 없습니다.\n다운로드 화면에서 현재 설정을 즐겨찾기로 저장하세요."
+            ctk.CTkLabel(self.favorite_grid, text=message, justify="center", font=self._font(12), text_color="#7180A5").grid(row=0, column=0, columnspan=2, padx=20, pady=70)
             return
-        for favorite in self.favorites:
-            card = ctk.CTkFrame(
-                self.favorite_list, corner_radius=10, fg_color="#17213A",
-                border_width=1, border_color="#26314E",
-            )
-            card.pack(fill="x", padx=2, pady=3)
-            name_button = ctk.CTkButton(
-                card, text=favorite.name, anchor="w", height=28, corner_radius=8,
-                fg_color="transparent", hover_color="#273450", font=self._font(10, "bold"),
+        for index, favorite in enumerate(visible):
+            card = ctk.CTkFrame(self.favorite_grid, corner_radius=16, fg_color=self.COLORS["surface"], border_width=1, border_color="#26314E")
+            card.grid(row=index // 2, column=index % 2, padx=7, pady=7, sticky="nsew")
+            card.grid_columnconfigure((0, 1, 2), weight=1, uniform="favorite_action")
+            ctk.CTkButton(
+                card, text=favorite.name, anchor="w", height=32, corner_radius=9,
+                fg_color="transparent", hover_color="#273450", font=self._font(12, "bold"),
                 command=lambda value=favorite: self._preview_favorite(value),
-            )
-            name_button.pack(fill="x", padx=4, pady=(4, 1))
-            actions = ctk.CTkFrame(card, fg_color="transparent")
-            actions.pack(fill="x", padx=4, pady=(0, 4))
-            ctk.CTkButton(
-                actions, text="미리보기", width=70, height=24, corner_radius=8,
-                fg_color="#273450", hover_color=self.COLORS["accent_hover"], font=self._font(9),
-                command=lambda value=favorite: self._preview_favorite(value),
-            ).pack(side="left", fill="x", expand=True, padx=(0, 3))
-            ctk.CTkButton(
-                actions, text="↓", width=28, height=24, corner_radius=8,
-                fg_color=self.COLORS["accent"], hover_color=self.COLORS["accent_hover"],
-                command=lambda value=favorite: self._download_favorite(value),
-            ).pack(side="left", padx=(0, 3))
-            ctk.CTkButton(
-                actions, text="×", width=26, height=24, corner_radius=8,
-                fg_color="#342133", hover_color="#49283C", text_color="#FFB3C0",
-                command=lambda value=favorite: self._delete_favorite(value),
-            ).pack(side="left")
+            ).grid(row=0, column=0, columnspan=4, padx=10, pady=(9, 2), sticky="ew")
+            host = urlparse(favorite.template_url).netloc
+            ctk.CTkLabel(card, text=host, anchor="w", font=self._font(9, "bold"), text_color=self.COLORS["accent"]).grid(row=1, column=0, columnspan=4, padx=13, sticky="ew")
+            details = f"캐릭터  {favorite.character}   ·   범위  {favorite.ranges}"
+            ctk.CTkLabel(card, text=details, anchor="w", justify="left", wraplength=320, font=self._font(10), text_color="#AAB7D8").grid(row=2, column=0, columnspan=4, padx=13, pady=(2, 8), sticky="ew")
+            ctk.CTkButton(card, text="미리보기", height=29, corner_radius=9, fg_color=self.COLORS["accent"], hover_color=self.COLORS["accent_hover"], font=self._font(9, "bold"), command=lambda value=favorite: self._preview_favorite(value)).grid(row=3, column=0, padx=(10, 4), pady=(0, 10), sticky="ew")
+            ctk.CTkButton(card, text="다운로드", height=29, corner_radius=9, fg_color="#273450", hover_color="#334364", font=self._font(9, "bold"), command=lambda value=favorite: self._download_favorite(value)).grid(row=3, column=1, padx=4, pady=(0, 10), sticky="ew")
+            ctk.CTkButton(card, text="불러오기", height=29, corner_radius=9, fg_color="#273450", hover_color="#334364", font=self._font(9), command=lambda value=favorite: self._load_favorite_to_form(value)).grid(row=3, column=2, padx=4, pady=(0, 10), sticky="ew")
+            ctk.CTkButton(card, text="삭제", width=48, height=29, corner_radius=9, fg_color="#342133", hover_color="#49283C", text_color="#FFB3C0", font=self._font(9), command=lambda value=favorite: self._delete_favorite(value)).grid(row=3, column=3, padx=(4, 10), pady=(0, 10))
 
     def _apply_favorite(self, favorite: FavoritePreset) -> None:
         values = {
@@ -1999,11 +2079,15 @@ class DownloaderApp(ctk.CTk):
             "동시 다운로드": str(favorite.concurrency),
             "Referer": favorite.referer or "",
         }
-        for label, value in values.items():
-            self.entry_vars[label].set(value)
-        self.separate_folders_var.set(favorite.separate_character_folders)
-        self.defender_scan_var.set(favorite.scan_with_defender)
-        self.folder_var.set(favorite.destination or "")
+        self.preview_updates_suspended = True
+        try:
+            for label, value in values.items():
+                self.entry_vars[label].set(value)
+            self.separate_folders_var.set(favorite.separate_character_folders)
+            self.defender_scan_var.set(favorite.scan_with_defender)
+            self.folder_var.set(favorite.destination or "")
+        finally:
+            self.preview_updates_suspended = False
         self._write_log(f"즐겨찾기 불러옴: {favorite.name}")
 
     def _save_current_favorite(self) -> None:
@@ -2071,13 +2155,6 @@ class DownloaderApp(ctk.CTk):
             self._write_log("다운로드 중에는 즐겨찾기 미리보기를 열 수 없습니다.")
             return
         self._apply_favorite(favorite)
-        if self.favorite_preview_after_id:
-            self.after_cancel(self.favorite_preview_after_id)
-        self.favorite_preview_after_id = self.after(120, self._start_favorite_preview)
-
-    def _start_favorite_preview(self) -> None:
-        """Start only after StringVar traces from applying the preset have drained."""
-        self.favorite_preview_after_id = None
         if self.preview_after_id:
             self.after_cancel(self.preview_after_id)
             self.preview_after_id = None
@@ -2247,9 +2324,6 @@ class DownloaderApp(ctk.CTk):
         if self.preview_after_id:
             self.after_cancel(self.preview_after_id)
             self.preview_after_id = None
-        if self.favorite_preview_after_id:
-            self.after_cancel(self.favorite_preview_after_id)
-            self.favorite_preview_after_id = None
         if gallery := getattr(self, "preview_gallery", None):
             if gallery.winfo_exists():
                 gallery.destroy()
