@@ -35,12 +35,14 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.11.0"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
 MAX_RELEASE_METADATA_BYTES = 256 * 1024
 MAX_UPDATE_INSTALLER_BYTES = 150 * 1024 * 1024
+FAVORITES_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LumaFetch" / "favorites.json"
+MAX_FAVORITES = 50
 def runtime_asset(name: str) -> Path:
     """Return a bundled PyInstaller asset or its source-tree equivalent."""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -222,6 +224,67 @@ class DownloadConfig(BaseModel):
                 values.setdefault(f"{number:0{width}d}", None)
         return list(values)
 
+
+class FavoritePreset(BaseModel):
+    """A named, validated snapshot of the download form."""
+
+    name: str = Field(min_length=1, max_length=40)
+    template_url: str
+    character: str
+    ranges: str
+    outfit: str = "X"
+    referer: str | None = None
+    concurrency: int = Field(default=20, ge=1, le=50)
+    separate_character_folders: bool = False
+    scan_with_defender: bool = False
+    fixed_destination: bool = False
+    destination: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        if not (name := value.strip()):
+            raise ValueError("즐겨찾기 이름을 입력하세요.")
+        return name
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> FavoritePreset:
+        DownloadConfig(
+            template_url=self.template_url,
+            character=self.character,
+            ranges=self.ranges,
+            outfit=self.outfit,
+            referer=self.referer,
+            concurrency=self.concurrency,
+            destination=Path(self.destination or Path.cwd()),
+            separate_character_folders=self.separate_character_folders,
+            scan_with_defender=self.scan_with_defender,
+        )
+        if self.fixed_destination and not self.destination:
+            raise ValueError("고정 저장 위치가 비어 있습니다.")
+        return self
+
+
+def load_favorites(path: Path = FAVORITES_FILE) -> list[FavoritePreset]:
+    """Load a bounded local preset file; malformed data never blocks startup."""
+    try:
+        if not path.is_file() or path.stat().st_size > 512 * 1024:
+            return []
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            return []
+        return [FavoritePreset.model_validate(item) for item in payload[:MAX_FAVORITES]]
+    except (OSError, ValueError, ValidationError, json.JSONDecodeError):
+        return []
+
+
+def save_favorites(favorites: list[FavoritePreset], path: Path = FAVORITES_FILE) -> None:
+    """Atomically save validated presets in the current user's app-data folder."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    payload = [favorite.model_dump(mode="json") for favorite in favorites[:MAX_FAVORITES]]
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 @dataclass(slots=True)
 class DownloadStats:
@@ -1026,6 +1089,7 @@ class DownloaderApp(ctk.CTk):
         self.viewer_sequence = 0
         self.viewer_photo: tk.PhotoImage | None = None
         self.update_checking = False
+        self.favorites = load_favorites()
         self._build()
         if "--update-complete" in sys.argv:
             self.update_status.configure(text=f"v{APP_VERSION} 업데이트 완료", text_color=self.COLORS["success"])
@@ -1054,6 +1118,11 @@ class DownloaderApp(ctk.CTk):
         ctk.CTkLabel(nav, text="↓  일괄 다운로드", font=self._font(11, "bold"), height=38, anchor="w").pack(fill="x", padx=12, pady=5)
         ctk.CTkLabel(sidebar, text="ASYNC · RETRY · FAST", font=self._font(9, "bold"), text_color=self.COLORS["muted"]).pack(anchor="w", padx=22, pady=(28, 8))
         ctk.CTkLabel(sidebar, text="여러 캐릭터와\n상황 범위를 한 번에 처리합니다.", justify="left", font=self._font(11), text_color=self.COLORS["muted"]).pack(anchor="w", padx=22)
+        favorites_title = ctk.CTkFrame(sidebar, fg_color="transparent")
+        favorites_title.pack(fill="x", padx=16, pady=(18, 4))
+        ctk.CTkLabel(favorites_title, text="★  즐겨찾기", font=self._font(11, "bold"), text_color="#DDE5FF").pack(side="left")
+        self.favorite_list = ctk.CTkScrollableFrame(sidebar, width=148, height=190, corner_radius=12, fg_color="#0D1528")
+        self.favorite_list.pack(fill="both", expand=True, padx=10, pady=(0, 8))
         self.version_label = ctk.CTkLabel(sidebar, text=f"v{APP_VERSION}", font=self._font(10), text_color="#5F6E92")
         self.version_label.pack(side="bottom", anchor="w", padx=22, pady=(8, 18))
         self.update_status = ctk.CTkLabel(sidebar, text="", font=self._font(9), text_color=self.COLORS["muted"], wraplength=140, justify="left")
@@ -1082,6 +1151,8 @@ class DownloaderApp(ctk.CTk):
         self.start_button.pack(side="right")
         self.preview_button = ctk.CTkButton(action_bar, text="▦  미리보기", width=108, height=38, corner_radius=13, fg_color="#273450", hover_color="#334364", font=self._font(11, "bold"), command=self._manual_preview)
         self.preview_button.pack(side="right", padx=(0, 8))
+        self.favorite_save_button = ctk.CTkButton(action_bar, text="☆  즐겨찾기", width=98, height=38, corner_radius=13, fg_color="#273450", hover_color="#334364", font=self._font(11, "bold"), command=self._save_current_favorite)
+        self.favorite_save_button.pack(side="right", padx=(0, 8))
         self.state_badge = ctk.CTkLabel(header, text="●  준비됨", corner_radius=14, fg_color="#16372D", text_color=self.COLORS["success"], font=self._font(10, "bold"), padx=10, pady=5)
         self.state_badge.grid(row=2, column=1, sticky="e", pady=(5, 0))
 
@@ -1148,6 +1219,7 @@ class DownloaderApp(ctk.CTk):
         activity.grid_columnconfigure(0, weight=1); activity.grid_rowconfigure(0, weight=1)
         self.log = ctk.CTkTextbox(activity, corner_radius=14, fg_color=self.COLORS["input"], border_width=0, font=self._font(11), text_color="#B9C5E3")
         self.log.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        self._render_favorites()
 
 
     def _check_for_updates(self) -> None:
@@ -1593,6 +1665,45 @@ class DownloaderApp(ctk.CTk):
         self.original_viewer.configure(fg_color=self.COLORS["bg"])
         self.original_viewer.grid_columnconfigure(1, weight=1)
         self.original_viewer.grid_rowconfigure(1, weight=1)
+        self.viewer_mode: Literal["fit", "fill", "manual"] = "fit"
+        self.viewer_zoom = 1.0
+        self.viewer_current_scale = 1.0
+        self.viewer_original_size = (1, 1)
+        self.viewer_render_after_id: str | None = None
+        self.viewer_fullscreen = False
+
+        toolbar = ctk.CTkFrame(self.original_viewer, fg_color="transparent")
+        toolbar.grid(row=0, column=0, columnspan=3, padx=18, pady=(12, 8), sticky="ew")
+        toolbar.grid_columnconfigure(0, weight=1)
+        self.viewer_summary = ctk.CTkLabel(
+            toolbar, text="원본 이미지를 준비합니다…", anchor="w",
+            font=self._font(11, "bold"), text_color=self.COLORS["muted"],
+        )
+        self.viewer_summary.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        self.viewer_fit_button = ctk.CTkButton(
+            toolbar, text="맞춤", width=66, height=30, corner_radius=10,
+            fg_color=self.COLORS["accent"], hover_color=self.COLORS["accent_hover"],
+            command=lambda: self._set_viewer_mode("fit"),
+        )
+        self.viewer_fit_button.grid(row=0, column=1, padx=3)
+        self.viewer_fill_button = ctk.CTkButton(
+            toolbar, text="화면 채우기", width=94, height=30, corner_radius=10,
+            fg_color="#273450", hover_color=self.COLORS["accent_hover"],
+            command=lambda: self._set_viewer_mode("fill"),
+        )
+        self.viewer_fill_button.grid(row=0, column=2, padx=3)
+        self.viewer_actual_button = ctk.CTkButton(
+            toolbar, text="100%", width=66, height=30, corner_radius=10,
+            fg_color="#273450", hover_color=self.COLORS["accent_hover"],
+            command=self._show_viewer_actual_size,
+        )
+        self.viewer_actual_button.grid(row=0, column=3, padx=3)
+        self.viewer_fullscreen_button = ctk.CTkButton(
+            toolbar, text="전체 화면", width=82, height=30, corner_radius=10,
+            fg_color="#273450", hover_color=self.COLORS["accent_hover"],
+            command=self._toggle_viewer_fullscreen,
+        )
+        self.viewer_fullscreen_button.grid(row=0, column=4, padx=(3, 0))
 
         self.viewer_previous = ctk.CTkButton(
             self.original_viewer, text="‹", width=58, height=58, corner_radius=18,
@@ -1606,27 +1717,92 @@ class DownloaderApp(ctk.CTk):
             font=self._font(28, "bold"), command=lambda: self._navigate_original(1),
         )
         self.viewer_next.grid(row=1, column=2, padx=(8, 18), sticky="e")
-        self.viewer_summary = ctk.CTkLabel(
-            self.original_viewer,
-            text="원본 이미지를 준비합니다…",
-            font=self._font(12, "bold"),
-            text_color=self.COLORS["muted"],
+
+        viewport = ctk.CTkFrame(self.original_viewer, corner_radius=14, fg_color=self.COLORS["input"])
+        viewport.grid(row=1, column=1, padx=4, pady=(0, 14), sticky="nsew")
+        viewport.grid_columnconfigure(0, weight=1)
+        viewport.grid_rowconfigure(0, weight=1)
+        self.viewer_canvas = tk.Canvas(
+            viewport, bg=self.COLORS["input"], bd=0, highlightthickness=0,
+            cursor="fleur", xscrollincrement=24, yscrollincrement=24,
         )
-        self.viewer_summary.grid(row=0, column=0, columnspan=3, padx=20, pady=(16, 8))
-        self.viewer_image = tk.Label(
-            self.original_viewer,
-            text="불러오는 중…",
-            bg=self.COLORS["input"],
-            fg="#AAB7D8",
-            bd=0,
-            highlightthickness=0,
-            font=("Segoe UI Variable", 13),
+        self.viewer_canvas.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=(6, 0))
+        self.viewer_vscroll = ctk.CTkScrollbar(viewport, command=self.viewer_canvas.yview)
+        self.viewer_vscroll.grid(row=0, column=1, sticky="ns", padx=(4, 5), pady=(6, 0))
+        self.viewer_hscroll = ctk.CTkScrollbar(viewport, orientation="horizontal", command=self.viewer_canvas.xview)
+        self.viewer_hscroll.grid(row=1, column=0, sticky="ew", padx=(6, 0), pady=(4, 5))
+        self.viewer_canvas.configure(
+            xscrollcommand=self.viewer_hscroll.set,
+            yscrollcommand=self.viewer_vscroll.set,
         )
-        self.viewer_image.grid(row=1, column=1, padx=8, pady=(0, 18), sticky="nsew")
+        self.viewer_canvas.bind("<MouseWheel>", self._on_viewer_wheel)
+        self.viewer_canvas.bind("<Configure>", self._on_viewer_resize)
+        self.viewer_canvas.bind("<ButtonPress-1>", lambda event: self.viewer_canvas.scan_mark(event.x, event.y))
+        self.viewer_canvas.bind("<B1-Motion>", lambda event: self.viewer_canvas.scan_dragto(event.x, event.y, gain=1))
         self.original_viewer.bind("<Left>", lambda _event: self._navigate_original(-1))
         self.original_viewer.bind("<Right>", lambda _event: self._navigate_original(1))
-        self.original_viewer.bind("<Escape>", lambda _event: self.original_viewer.withdraw())
-        self.original_viewer.protocol("WM_DELETE_WINDOW", self.original_viewer.withdraw)
+        self.original_viewer.bind("<F11>", lambda _event: self._toggle_viewer_fullscreen())
+        self.original_viewer.bind("<Escape>", self._on_viewer_escape)
+        self.original_viewer.protocol("WM_DELETE_WINDOW", self._hide_original_viewer)
+
+    def _hide_original_viewer(self) -> None:
+        self.viewer_sequence += 1
+        if getattr(self, "viewer_fullscreen", False):
+            self.original_viewer.attributes("-fullscreen", False)
+            self.viewer_fullscreen = False
+        self.original_viewer.withdraw()
+
+    def _on_viewer_escape(self, _event: object | None = None) -> None:
+        if self.viewer_fullscreen:
+            self._toggle_viewer_fullscreen()
+        else:
+            self._hide_original_viewer()
+
+    def _toggle_viewer_fullscreen(self) -> None:
+        self.viewer_fullscreen = not self.viewer_fullscreen
+        self.original_viewer.attributes("-fullscreen", self.viewer_fullscreen)
+        self.viewer_fullscreen_button.configure(text="창 화면" if self.viewer_fullscreen else "전체 화면")
+        self._schedule_viewer_render(140)
+
+    def _sync_viewer_mode_buttons(self) -> None:
+        active = self.COLORS["accent"]
+        inactive = "#273450"
+        self.viewer_fit_button.configure(fg_color=active if self.viewer_mode == "fit" else inactive)
+        self.viewer_fill_button.configure(fg_color=active if self.viewer_mode == "fill" else inactive)
+        self.viewer_actual_button.configure(
+            fg_color=active if self.viewer_mode == "manual" and abs(self.viewer_zoom - 1.0) < 0.001 else inactive
+        )
+
+    def _set_viewer_mode(self, mode: Literal["fit", "fill"]) -> None:
+        self.viewer_mode = mode
+        self._sync_viewer_mode_buttons()
+        self._schedule_viewer_render(20)
+
+    def _show_viewer_actual_size(self) -> None:
+        self.viewer_mode = "manual"
+        self.viewer_zoom = 1.0
+        self._sync_viewer_mode_buttons()
+        self._schedule_viewer_render(20)
+
+    def _on_viewer_wheel(self, event: tk.Event[tk.Misc]) -> str:
+        if not getattr(self, "viewer_current_item", None):
+            return "break"
+        factor = 1.15 if (event.delta or 0) > 0 else 1 / 1.15
+        base = self.viewer_current_scale if self.viewer_mode != "manual" else self.viewer_zoom
+        self.viewer_zoom = min(4.0, max(0.08, base * factor))
+        self.viewer_mode = "manual"
+        self._sync_viewer_mode_buttons()
+        self._schedule_viewer_render(55)
+        return "break"
+
+    def _on_viewer_resize(self, _event: tk.Event[tk.Misc]) -> None:
+        if getattr(self, "viewer_mode", "fit") in {"fit", "fill"} and getattr(self, "viewer_current_item", None):
+            self._schedule_viewer_render(140)
+
+    def _schedule_viewer_render(self, delay: int = 0) -> None:
+        if self.viewer_render_after_id:
+            self.after_cancel(self.viewer_render_after_id)
+        self.viewer_render_after_id = self.after(delay, self._request_viewer_render)
 
     def _open_original(self, index: int) -> None:
         indices = sorted(self.gallery_items)
@@ -1635,6 +1811,8 @@ class DownloaderApp(ctk.CTk):
         self._ensure_original_viewer()
         self.viewer_indices = indices
         self.viewer_position = indices.index(index)
+        self.viewer_mode = "fit"
+        self._sync_viewer_mode_buttons()
         self.original_viewer.deiconify()
         self.original_viewer.lift()
         self.original_viewer.focus_force()
@@ -1648,6 +1826,8 @@ class DownloaderApp(ctk.CTk):
         current_position = indices.index(previous) if previous in indices else 0
         self.viewer_indices = indices
         self.viewer_position = (current_position + step) % len(indices)
+        self.viewer_mode = "fit"
+        self._sync_viewer_mode_buttons()
         self._show_original_at_position()
 
     def _show_original_at_position(self) -> None:
@@ -1655,20 +1835,33 @@ class DownloaderApp(ctk.CTk):
         item = self.gallery_items.get(index)
         if item is None:
             return
+        self.viewer_current_item = item
+        self.viewer_canvas.delete("all")
+        self.viewer_canvas.create_text(
+            max(1, self.viewer_canvas.winfo_width()) // 2,
+            max(1, self.viewer_canvas.winfo_height()) // 2,
+            text="원본 이미지를 불러오는 중…", fill="#AAB7D8", font=("Segoe UI Variable", 13),
+        )
+        self._schedule_viewer_render(10)
+
+    def _request_viewer_render(self) -> None:
+        self.viewer_render_after_id = None
+        item = getattr(self, "viewer_current_item", None)
+        if item is None:
+            return
         self.viewer_sequence += 1
         sequence = self.viewer_sequence
-        self.viewer_image.configure(image="", text="원본 이미지를 불러오는 중…")
-        self.viewer_summary.configure(
-            text=f"{item.character} / {item.situation}  ·  {self.viewer_position + 1}/{len(self.viewer_indices)}  ·  ← → 키로 이동"
-        )
         self.original_viewer.update_idletasks()
-        max_size = (
-            max(480, self.original_viewer.winfo_width() - 190),
-            max(360, self.original_viewer.winfo_height() - 100),
+        viewport_size = (
+            max(320, self.viewer_canvas.winfo_width() - 8),
+            max(240, self.viewer_canvas.winfo_height() - 8),
         )
         threading.Thread(
             target=self._viewer_decode_worker,
-            args=(sequence, item, max_size, self.viewer_position, len(self.viewer_indices)),
+            args=(
+                sequence, item, viewport_size, self.viewer_mode, self.viewer_zoom,
+                self.viewer_position, len(self.viewer_indices),
+            ),
             daemon=True,
         ).start()
 
@@ -1676,7 +1869,9 @@ class DownloaderApp(ctk.CTk):
         self,
         sequence: int,
         item: PreviewImage,
-        max_size: tuple[int, int],
+        viewport_size: tuple[int, int],
+        mode: Literal["fit", "fill", "manual"],
+        zoom: float,
         position: int,
         total: int,
     ) -> None:
@@ -1685,12 +1880,24 @@ class DownloaderApp(ctk.CTk):
             source_value = item.cache_path if item.cache_path else BytesIO(item.data)
             with Image.open(source_value) as source:
                 original_size = source.size
-                display = ImageOps.contain(source.convert("RGB"), max_size)
+                width, height = original_size
+                match mode:
+                    case "fit":
+                        scale = min(viewport_size[0] / width, viewport_size[1] / height)
+                    case "fill":
+                        scale = max(viewport_size[0] / width, viewport_size[1] / height)
+                    case _:
+                        scale = zoom
+                pixel_limit_scale = (16_000_000 / max(1, width * height)) ** 0.5
+                scale = min(4.0, pixel_limit_scale, max(0.08, scale))
+                display_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+                rgb = source.convert("RGB")
+                display = rgb if display_size == original_size else rgb.resize(display_size, Image.Resampling.LANCZOS)
             buffer = BytesIO()
             display.save(buffer, format="PPM")
             self.events.put((
                 "viewer_image",
-                (sequence, item, buffer.getvalue(), original_size, display.size, position, total),
+                (sequence, item, buffer.getvalue(), original_size, display_size, position, total),
             ))
         except Exception as error:
             self.events.put(("viewer_error", (sequence, item, str(error))))
@@ -1705,14 +1912,190 @@ class DownloaderApp(ctk.CTk):
         total: int,
     ) -> None:
         self.viewer_photo = tk.PhotoImage(data=ppm, format="PPM")
-        self.viewer_image.configure(image=self.viewer_photo, text="")
-        scale = min(display_size[0] / original_size[0], display_size[1] / original_size[1], 1.0)
+        canvas_width = max(1, self.viewer_canvas.winfo_width())
+        canvas_height = max(1, self.viewer_canvas.winfo_height())
+        region_width = max(canvas_width, display_size[0])
+        region_height = max(canvas_height, display_size[1])
+        image_x = max(0, (region_width - display_size[0]) // 2)
+        image_y = max(0, (region_height - display_size[1]) // 2)
+        self.viewer_canvas.delete("all")
+        self.viewer_canvas.create_image(image_x, image_y, image=self.viewer_photo, anchor="nw")
+        self.viewer_canvas.configure(scrollregion=(0, 0, region_width, region_height))
+        if region_width > canvas_width:
+            self.viewer_canvas.xview_moveto((region_width - canvas_width) / 2 / region_width)
+        else:
+            self.viewer_canvas.xview_moveto(0)
+        if region_height > canvas_height:
+            self.viewer_canvas.yview_moveto((region_height - canvas_height) / 2 / region_height)
+        else:
+            self.viewer_canvas.yview_moveto(0)
+        self.viewer_original_size = original_size
+        self.viewer_current_scale = display_size[0] / max(1, original_size[0])
+        if self.viewer_mode == "manual":
+            self.viewer_zoom = self.viewer_current_scale
+        mode_text = {"fit": "화면 맞춤", "fill": "화면 채우기", "manual": "수동 확대"}[self.viewer_mode]
         self.viewer_summary.configure(
             text=(
                 f"{item.character} / {item.situation}  ·  {position + 1}/{total}  ·  "
-                f"원본 {original_size[0]}×{original_size[1]}  ·  표시 {scale:.0%}  ·  ← → 키로 이동"
+                f"원본 {original_size[0]}×{original_size[1]}  ·  {mode_text} {self.viewer_current_scale:.0%}  ·  휠 확대/축소"
             )
         )
+    def _render_favorites(self) -> None:
+        if not hasattr(self, "favorite_list"):
+            return
+        for child in self.favorite_list.winfo_children():
+            child.destroy()
+        if not self.favorites:
+            ctk.CTkLabel(
+                self.favorite_list, text="저장된 항목 없음", font=self._font(9),
+                text_color="#7180A5",
+            ).pack(padx=6, pady=12)
+            return
+        for favorite in self.favorites:
+            card = ctk.CTkFrame(
+                self.favorite_list, corner_radius=10, fg_color="#17213A",
+                border_width=1, border_color="#26314E",
+            )
+            card.pack(fill="x", padx=2, pady=3)
+            name_button = ctk.CTkButton(
+                card, text=favorite.name, anchor="w", height=28, corner_radius=8,
+                fg_color="transparent", hover_color="#273450", font=self._font(10, "bold"),
+                command=lambda value=favorite: self._preview_favorite(value),
+            )
+            name_button.pack(fill="x", padx=4, pady=(4, 1))
+            actions = ctk.CTkFrame(card, fg_color="transparent")
+            actions.pack(fill="x", padx=4, pady=(0, 4))
+            ctk.CTkButton(
+                actions, text="미리보기", width=70, height=24, corner_radius=8,
+                fg_color="#273450", hover_color=self.COLORS["accent_hover"], font=self._font(9),
+                command=lambda value=favorite: self._preview_favorite(value),
+            ).pack(side="left", fill="x", expand=True, padx=(0, 3))
+            ctk.CTkButton(
+                actions, text="↓", width=28, height=24, corner_radius=8,
+                fg_color=self.COLORS["accent"], hover_color=self.COLORS["accent_hover"],
+                command=lambda value=favorite: self._download_favorite(value),
+            ).pack(side="left", padx=(0, 3))
+            ctk.CTkButton(
+                actions, text="×", width=26, height=24, corner_radius=8,
+                fg_color="#342133", hover_color="#49283C", text_color="#FFB3C0",
+                command=lambda value=favorite: self._delete_favorite(value),
+            ).pack(side="left")
+
+    def _apply_favorite(self, favorite: FavoritePreset) -> None:
+        values = {
+            "템플릿 URL": favorite.template_url,
+            "캐릭터 코드": favorite.character,
+            "의상 코드": favorite.outfit,
+            "상황 코드 범위": favorite.ranges,
+            "동시 다운로드": str(favorite.concurrency),
+            "Referer": favorite.referer or "",
+        }
+        for label, value in values.items():
+            self.entry_vars[label].set(value)
+        self.separate_folders_var.set(favorite.separate_character_folders)
+        self.defender_scan_var.set(favorite.scan_with_defender)
+        self.folder_var.set(favorite.destination or "")
+        self._write_log(f"즐겨찾기 불러옴: {favorite.name}")
+
+    def _save_current_favorite(self) -> None:
+        from tkinter import filedialog, messagebox
+        try:
+            config = self._preview_config()
+            concurrency = int(self.entries["동시 다운로드"].get().strip() or 20)
+            if not 1 <= concurrency <= 50:
+                raise ValueError("동시 다운로드는 1~50 사이여야 합니다.")
+        except (ValidationError, ValueError) as error:
+            self._write_log(f"즐겨찾기 저장 오류: {error}")
+            return
+        dialog = ctk.CTkInputDialog(text="즐겨찾기 이름을 입력하세요.", title="즐겨찾기 저장")
+        if not (name := (dialog.get_input() or "").strip()):
+            return
+        fixed_destination = messagebox.askyesno(
+            "저장 위치 고정",
+            "현재 저장 위치를 이 즐겨찾기에 고정할까요?\n\n아니요를 선택하면 바로 다운로드할 때마다 폴더를 묻습니다.",
+            parent=self,
+        )
+        destination = self.folder_var.get().strip() or None
+        if fixed_destination and not destination:
+            destination = filedialog.askdirectory(initialdir=str(Path.cwd()), parent=self) or None
+            if not destination:
+                self._write_log("고정 저장 위치 선택이 취소되어 즐겨찾기를 저장하지 않았습니다.")
+                return
+            self.folder_var.set(destination)
+        try:
+            preset = FavoritePreset(
+                name=name,
+                template_url=config.template_url,
+                character=config.character,
+                ranges=config.ranges,
+                outfit=config.outfit,
+                referer=config.referer,
+                concurrency=concurrency,
+                separate_character_folders=self.separate_folders_var.get(),
+                scan_with_defender=self.defender_scan_var.get(),
+                fixed_destination=fixed_destination,
+                destination=destination if fixed_destination else None,
+            )
+        except (ValidationError, ValueError) as error:
+            self._write_log(f"즐겨찾기 저장 오류: {error}")
+            return
+        existing = next((item for item in self.favorites if item.name.casefold() == preset.name.casefold()), None)
+        if existing and not messagebox.askyesno("즐겨찾기 갱신", f"'{existing.name}' 설정을 덮어쓸까요?", parent=self):
+            return
+        if existing:
+            self.favorites[self.favorites.index(existing)] = preset
+        else:
+            if len(self.favorites) >= MAX_FAVORITES:
+                self._write_log(f"즐겨찾기는 최대 {MAX_FAVORITES}개까지 저장할 수 있습니다.")
+                return
+            self.favorites.append(preset)
+        try:
+            save_favorites(self.favorites)
+        except OSError as error:
+            self._write_log(f"즐겨찾기 파일 저장 실패: {error}")
+            return
+        self._render_favorites()
+        self._write_log(f"즐겨찾기 저장 완료: {preset.name}")
+
+    def _preview_favorite(self, favorite: FavoritePreset) -> None:
+        if self.running:
+            self._write_log("다운로드 중에는 즐겨찾기 미리보기를 열 수 없습니다.")
+            return
+        self._apply_favorite(favorite)
+        self._manual_preview()
+
+    def _download_favorite(self, favorite: FavoritePreset) -> None:
+        from tkinter import filedialog
+        if self.running:
+            self._write_log("이미 다운로드가 진행 중입니다.")
+            return
+        self._apply_favorite(favorite)
+        if favorite.fixed_destination and favorite.destination:
+            self.folder_var.set(favorite.destination)
+        else:
+            selected = filedialog.askdirectory(
+                initialdir=self.folder_var.get() or str(Path.cwd()),
+                title=f"{favorite.name} 저장 위치",
+                parent=self,
+            )
+            if not selected:
+                self._write_log("즐겨찾기 다운로드가 취소되었습니다.")
+                return
+            self.folder_var.set(selected)
+        self._start()
+
+    def _delete_favorite(self, favorite: FavoritePreset) -> None:
+        from tkinter import messagebox
+        if not messagebox.askyesno("즐겨찾기 삭제", f"'{favorite.name}' 항목을 삭제할까요?", parent=self):
+            return
+        self.favorites = [item for item in self.favorites if item is not favorite]
+        try:
+            save_favorites(self.favorites)
+        except OSError as error:
+            self._write_log(f"즐겨찾기 파일 저장 실패: {error}")
+            return
+        self._render_favorites()
+        self._write_log(f"즐겨찾기 삭제: {favorite.name}")
     def _choose_folder(self) -> None:
         from tkinter import filedialog
         if selected := filedialog.askdirectory(initialdir=self.folder_var.get() or str(Path.cwd())): self.folder_var.set(selected)
@@ -1799,7 +2182,8 @@ class DownloaderApp(ctk.CTk):
             elif kind == "viewer_error":
                 sequence, item, message = payload
                 if sequence == self.viewer_sequence:
-                    self.viewer_image.configure(image="", text="원본 이미지를 표시할 수 없습니다.")
+                    self.viewer_canvas.delete("all")
+                    self.viewer_canvas.create_text(max(1, self.viewer_canvas.winfo_width()) // 2, max(1, self.viewer_canvas.winfo_height()) // 2, text="원본 이미지를 표시할 수 없습니다.", fill="#AAB7D8", font=("Segoe UI Variable", 13))
                     self.viewer_summary.configure(text=f"{item.character} / {item.situation} · {message}")
             elif kind == "update_result":
                 assert isinstance(payload, UpdateInfo)
@@ -1838,6 +2222,9 @@ class DownloaderApp(ctk.CTk):
         self.preview_cancel_event.set()
         if update_cancel := getattr(self, "update_download_cancel", None):
             update_cancel.set()
+        if viewer_render := getattr(self, "viewer_render_after_id", None):
+            self.after_cancel(viewer_render)
+            self.viewer_render_after_id = None
         if self.preview_after_id:
             self.after_cancel(self.preview_after_id)
             self.preview_after_id = None
