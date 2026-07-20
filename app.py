@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.12.1"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -1503,7 +1503,6 @@ class DownloaderApp(ctk.CTk):
         entry.grid(row=1, column=0, sticky="ew")
         entry.bind("<KeyRelease>", self._queue_preview_update)
         entry.bind("<FocusOut>", self._queue_preview_update)
-        entry.bind("<<Paste>>", lambda _event: self.after(25, self._queue_preview_update))
         self.entries[label] = entry
         self.entry_vars[label] = variable
         variable.trace_add("write", lambda *_args: self._trace_preview_update())
@@ -1511,12 +1510,21 @@ class DownloaderApp(ctk.CTk):
     def _trace_preview_update(self) -> None:
         """Ignore programmatic favorite loads while preserving normal live validation."""
         if not self.preview_updates_suspended:
-            self.after_idle(self._queue_preview_update)
+            self._queue_preview_update()
+
+    def _cancel_preview_update(self) -> None:
+        """Cancel the only tracked input invalidation before an explicit action."""
+        if not self.preview_after_id:
+            return
+        after_id, self.preview_after_id = self.preview_after_id, None
+        try:
+            self.after_cancel(after_id)
+        except tk.TclError:
+            pass
 
     def _queue_preview_update(self, _event: object | None = None) -> None:
         """Coalesce rapid field changes without cancelling a favorite preview being opened."""
-        if self.preview_after_id:
-            self.after_cancel(self.preview_after_id)
+        self._cancel_preview_update()
         self.preview_after_id = self.after(45, self._update_preview)
 
     def _preview_config(self) -> DownloadConfig:
@@ -1549,6 +1557,7 @@ class DownloaderApp(ctk.CTk):
 
     def _manual_preview(self) -> None:
         """Open the character selector; no network request starts before a character is clicked."""
+        self._cancel_preview_update()
         if self.running:
             self._write_log("다운로드 중에는 미리보기를 새로 요청할 수 없습니다.")
             return
@@ -2092,6 +2101,7 @@ class DownloaderApp(ctk.CTk):
 
     def _save_current_favorite(self) -> None:
         from tkinter import filedialog, messagebox
+        self._cancel_preview_update()
         try:
             config = self._preview_config()
             concurrency = int(self.entries["동시 다운로드"].get().strip() or 20)
@@ -2155,9 +2165,6 @@ class DownloaderApp(ctk.CTk):
             self._write_log("다운로드 중에는 즐겨찾기 미리보기를 열 수 없습니다.")
             return
         self._apply_favorite(favorite)
-        if self.preview_after_id:
-            self.after_cancel(self.preview_after_id)
-            self.preview_after_id = None
         self._manual_preview()
 
     def _download_favorite(self, favorite: FavoritePreset) -> None:
@@ -2321,9 +2328,7 @@ class DownloaderApp(ctk.CTk):
         if viewer_render := getattr(self, "viewer_render_after_id", None):
             self.after_cancel(viewer_render)
             self.viewer_render_after_id = None
-        if self.preview_after_id:
-            self.after_cancel(self.preview_after_id)
-            self.preview_after_id = None
+        self._cancel_preview_update()
         if gallery := getattr(self, "preview_gallery", None):
             if gallery.winfo_exists():
                 gallery.destroy()
