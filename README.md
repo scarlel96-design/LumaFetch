@@ -7,9 +7,9 @@ Luma Fetch is a Windows desktop batch downloader for image URLs that follow a pr
 - Async downloads using `aiohttp` and `aiofiles`
 - Multiple character codes and numeric situation ranges
 - Korean template aliases such as `캐릭터`, `상황`, and `의상`
-- Manual character gallery with first-image covers and an uncapped, virtualized thumbnail grid
+- Manual character gallery with first-image covers and an uncapped, Canvas-native virtualized thumbnail grid
 - Large original-image viewer with mouse selection and Left/Right keyboard navigation
-- Off-thread thumbnail decoding, bounded queues, disk-backed preview cache, and automatic cache cleanup
+- Split network/decode pipeline, bounded queues, frame-sliced rendering, disk-backed preview cache, and automatic cache cleanup
 - Optional Referer header support for hosts that restrict cross-site images
 - GitHub Releases updates with in-app download, SHA-256 verification, silent installation, and automatic restart
 - Installer prerequisite detection with opt-in Microsoft VC++ Runtime installation from a pinned official HTTPS package
