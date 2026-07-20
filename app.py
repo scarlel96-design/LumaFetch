@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.10.1"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -452,7 +452,8 @@ class PreviewImage:
 def encode_thumbnail_ppm(data: bytes, size: tuple[int, int]) -> bytes:
     """Decode and resize away from Tk's UI thread."""
     with Image.open(BytesIO(data)) as source:
-        image = ImageOps.contain(source.convert("RGB"), size)
+        source.draft("RGB", size)
+        image = ImageOps.contain(source.convert("RGB"), size, method=Image.Resampling.BILINEAR)
     buffer = BytesIO()
     image.save(buffer, format="PPM")
     return buffer.getvalue()
@@ -474,12 +475,20 @@ async def fetch_live_previews(
     cancelled: threading.Event,
     cache_dir: Path | None = None,
 ) -> PreviewBatch:
-    """Stream one character lazily with a bounded worker pool, regardless of range size."""
+    """Stream previews through separate, backpressured network and decode pipelines."""
     situations = config.expand_situations()
     total = len(situations)
     probe = Downloader(config, threading.Event(), lambda _kind, _payload: None)
-    worker_count = min(8, max(1, total))
-    connector = aiohttp.TCPConnector(limit=worker_count, limit_per_host=worker_count, ttl_dns_cache=300, resolver=PublicResolver())
+    network_workers = min(16, max(1, total))
+    decode_workers = min(4, max(1, total))
+    connector = aiohttp.TCPConnector(
+        limit=network_workers,
+        limit_per_host=network_workers,
+        ttl_dns_cache=600,
+        keepalive_timeout=30,
+        enable_cleanup_closed=True,
+        resolver=PublicResolver(),
+    )
     timeout = aiohttp.ClientTimeout(total=25, connect=10, sock_read=18)
     headers = make_request_headers(config.referer)
     next_index = 0
@@ -501,7 +510,7 @@ async def fetch_live_previews(
             return "Timeout: the image server did not respond in time."
         return str(error)
 
-    async def fetch_one(session: aiohttp.ClientSession, index: int, situation: str) -> tuple[PreviewImage | None, str | None]:
+    async def fetch_one(session: aiohttp.ClientSession, situation: str) -> tuple[PreviewImage | None, str | None]:
         last_error: Exception | None = None
         for candidate in probe.situation_candidates(situation):
             if cancelled.is_set():
@@ -521,47 +530,86 @@ async def fetch_live_previews(
                     data = await read_image_response(response)
                     if not SecurityGuard.has_safe_image_signature(data[:32]):
                         raise ValueError("Image signature is not allowed.")
-                    thumbnail = await asyncio.to_thread(encode_thumbnail_ppm, data, (178, 178))
-                    if cache_dir:
-                        original_path = cache_dir / f"{index:08d}.image"
-                        thumbnail_path = cache_dir / f"{index:08d}.ppm"
-                        async with aiofiles.open(original_path, "wb") as original_file:
-                            await original_file.write(data)
-                        async with aiofiles.open(thumbnail_path, "wb") as thumbnail_file:
-                            await thumbnail_file.write(thumbnail)
-                        return PreviewImage(
-                            character, situation, url,
-                            cache_path=original_path,
-                            thumbnail_path=thumbnail_path,
-                        ), None
-                    return PreviewImage(character, situation, url, data, thumbnail), None
+                    return PreviewImage(character, situation, url, data=data), None
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as error:
                 last_error = error
         return None, reason(last_error or RuntimeError("Unknown preview failure."))
 
-    async def worker(session: aiohttp.ClientSession) -> None:
-        nonlocal next_index, success, failed
+    pipeline: asyncio.Queue[tuple[int, PreviewImage] | None] = asyncio.Queue(
+        maxsize=network_workers * 2
+    )
+
+    async def network_worker(session: aiohttp.ClientSession) -> None:
+        nonlocal next_index, failed
         while not cancelled.is_set():
             async with index_lock:
                 if next_index >= total:
                     return
                 index = next_index
                 next_index += 1
-            item, error = await fetch_one(session, index, situations[index])
+            item, error = await fetch_one(session, situations[index])
             if cancelled.is_set():
                 return
             if item is not None:
-                success += 1
-                on_item(index, item)
+                await pipeline.put((index, item))
             else:
                 failed += 1
                 if error and error not in errors and len(errors) < 3:
                     errors.append(error)
 
+    async def write_cache(path: Path, data: bytes) -> None:
+        async with aiofiles.open(path, "wb") as file:
+            await file.write(data)
+
+    async def decode_worker() -> None:
+        nonlocal success, failed
+        while (work := await pipeline.get()) is not None:
+            index, item = work
+            try:
+                if cancelled.is_set():
+                    continue
+                thumbnail = await asyncio.to_thread(encode_thumbnail_ppm, item.data, (178, 178))
+                if cache_dir:
+                    original_path = cache_dir / f"{index:08d}.image"
+                    thumbnail_path = cache_dir / f"{index:08d}.ppm"
+                    await asyncio.gather(
+                        write_cache(original_path, item.data),
+                        write_cache(thumbnail_path, thumbnail),
+                    )
+                    ready = PreviewImage(
+                        item.character,
+                        item.situation,
+                        item.url,
+                        cache_path=original_path,
+                        thumbnail_path=thumbnail_path,
+                    )
+                else:
+                    ready = PreviewImage(
+                        item.character,
+                        item.situation,
+                        item.url,
+                        data=item.data,
+                        thumbnail_ppm=thumbnail,
+                    )
+                success += 1
+                on_item(index, ready)
+            except (OSError, ValueError, UnidentifiedImageError) as error:
+                failed += 1
+                message = reason(error)
+                if message not in errors and len(errors) < 3:
+                    errors.append(message)
+            finally:
+                pipeline.task_done()
+
     async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
-        await asyncio.gather(*(worker(session) for _ in range(worker_count)))
+        decoders = [asyncio.create_task(decode_worker()) for _ in range(decode_workers)]
+        await asyncio.gather(*(network_worker(session) for _ in range(network_workers)))
+        for _ in decoders:
+            await pipeline.put(None)
+        await asyncio.gather(*decoders)
     requested = success + failed
     return PreviewBatch(total=total, requested=requested, success=success, failed=failed, errors=errors)
+
 async def fetch_preview_covers(
     config: DownloadConfig,
     on_item: Callable[[str, PreviewImage], None],
@@ -745,11 +793,13 @@ class Downloader:
         return self.stats
 
 class VirtualPreviewGrid(ctk.CTkFrame):
-    """Windowed thumbnail grid: only visible rows own Tk widgets and images."""
+    """Canvas-native virtual grid: only visible thumbnails exist in Tk."""
 
     CELL_WIDTH = 204
     CELL_HEIGHT = 226
-    OVERSCAN_ROWS = 2
+    OVERSCAN_ROWS = 1
+    PHOTO_CACHE_LIMIT = 48
+    RENDER_BATCH_SIZE = 4
 
     def __init__(
         self,
@@ -763,6 +813,7 @@ class VirtualPreviewGrid(ctk.CTkFrame):
         super().__init__(parent, fg_color="transparent")
         self.colors = colors
         self.font_factory = font_factory
+        self.label_font = font_factory(10, "bold")
         self.photo_factory = photo_factory
         self.on_open = on_open
         self.items: dict[int, PreviewImage] = {}
@@ -770,7 +821,10 @@ class VirtualPreviewGrid(ctk.CTkFrame):
         self.total_slots = 0
         self.compact = False
         self.columns = 1
-        self.visible: dict[int, tuple[int, ctk.CTkFrame, tk.PhotoImage]] = {}
+        self.cell_width = self.CELL_WIDTH
+        self.layout_width = 0
+        self.visible: dict[int, tuple[int, tuple[int, ...], tk.PhotoImage]] = {}
+        self.photo_cache: dict[int, tk.PhotoImage] = {}
         self.redraw_id: str | None = None
 
         self.grid_columnconfigure(0, weight=1)
@@ -781,6 +835,8 @@ class VirtualPreviewGrid(ctk.CTkFrame):
             bd=0,
             highlightthickness=0,
             relief="flat",
+            cursor="hand2",
+            yscrollincrement=24,
         )
         self.scrollbar = ctk.CTkScrollbar(self, command=self._scroll_to)
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
@@ -788,10 +844,12 @@ class VirtualPreviewGrid(ctk.CTkFrame):
         self.scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         self.canvas.bind("<Configure>", self._on_configure)
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Button-1>", self._on_click)
 
     def reset(self, total: int) -> None:
         self.items.clear()
         self.ordered_indices.clear()
+        self.photo_cache.clear()
         self.total_slots = total
         self.compact = False
         self.canvas.yview_moveto(0)
@@ -805,13 +863,13 @@ class VirtualPreviewGrid(ctk.CTkFrame):
     def finish(self) -> None:
         self.compact = True
         self.ordered_indices = sorted(self.items)
-        self.canvas.yview_moveto(0)
         self._destroy_visible()
         self._schedule_redraw()
 
     def clear(self) -> None:
         self.items.clear()
         self.ordered_indices.clear()
+        self.photo_cache.clear()
         self.total_slots = 0
         self.compact = False
         self._destroy_visible()
@@ -825,8 +883,9 @@ class VirtualPreviewGrid(ctk.CTkFrame):
     def _on_configure(self, _event: tk.Event[tk.Misc]) -> None:
         width = max(1, self.canvas.winfo_width())
         columns = max(2, width // self.CELL_WIDTH)
-        if columns != self.columns:
+        if columns != self.columns or abs(width - self.layout_width) >= 8:
             self.columns = columns
+            self.layout_width = width
             self._destroy_visible()
         self._schedule_redraw()
 
@@ -838,22 +897,40 @@ class VirtualPreviewGrid(ctk.CTkFrame):
         delta = event.delta or 0
         direction = -1 if delta > 0 else 1
         magnitude = max(1, abs(delta) // 120)
-        self.canvas.yview_scroll(direction * magnitude * 3, "units")
+        self.canvas.yview_scroll(direction * magnitude * 2, "units")
         self._schedule_redraw()
         return "break"
 
-    def _bind_wheel(self, widget: tk.Misc) -> None:
-        widget.bind("<MouseWheel>", self._on_mousewheel)
+    def _on_click(self, event: tk.Event[tk.Misc]) -> None:
+        column = min(self.columns - 1, max(0, int(self.canvas.canvasx(event.x) // self.cell_width)))
+        row = max(0, int(self.canvas.canvasy(event.y) // self.CELL_HEIGHT))
+        position = row * self.columns + column
+        if resolved := self._item_for_position(position):
+            self.on_open(resolved[0])
 
     def _schedule_redraw(self) -> None:
         if self.redraw_id is None:
-            self.redraw_id = self.after_idle(self._redraw)
+            self.redraw_id = self.after(12, self._redraw)
 
     def _destroy_visible(self) -> None:
-        for window_id, card, _photo in self.visible.values():
-            self.canvas.delete(window_id)
-            card.destroy()
+        for _index, canvas_ids, _photo in self.visible.values():
+            for canvas_id in canvas_ids:
+                self.canvas.delete(canvas_id)
         self.visible.clear()
+
+    def _cached_photo(self, index: int, item: PreviewImage) -> tk.PhotoImage:
+        if photo := self.photo_cache.pop(index, None):
+            self.photo_cache[index] = photo
+            return photo
+        photo = self.photo_factory(item)
+        self.photo_cache[index] = photo
+        visible_indices = {entry[0] for entry in self.visible.values()}
+        while len(self.photo_cache) > self.PHOTO_CACHE_LIMIT:
+            stale = next((key for key in self.photo_cache if key not in visible_indices), None)
+            if stale is None:
+                break
+            self.photo_cache.pop(stale, None)
+        return photo
 
     def _redraw(self) -> None:
         self.redraw_id = None
@@ -861,23 +938,24 @@ class VirtualPreviewGrid(ctk.CTkFrame):
         rows = (slot_count + self.columns - 1) // self.columns
         total_height = max(1, rows * self.CELL_HEIGHT)
         width = max(1, self.canvas.winfo_width())
+        self.cell_width = max(170, width // self.columns)
         self.canvas.configure(scrollregion=(0, 0, width, total_height))
 
         top = max(0, int(self.canvas.canvasy(0) // self.CELL_HEIGHT) - self.OVERSCAN_ROWS)
         bottom = min(
             rows,
-            int((self.canvas.canvasy(self.canvas.winfo_height()) // self.CELL_HEIGHT))
+            int(self.canvas.canvasy(self.canvas.winfo_height()) // self.CELL_HEIGHT)
             + self.OVERSCAN_ROWS + 2,
         )
-        wanted_positions = set(range(top * self.columns, min(slot_count, bottom * self.columns)))
+        wanted = set(range(top * self.columns, min(slot_count, bottom * self.columns)))
         for position in list(self.visible):
-            if position not in wanted_positions or self._item_for_position(position) is None:
-                window_id, card, _photo = self.visible.pop(position)
-                self.canvas.delete(window_id)
-                card.destroy()
+            if position not in wanted or self._item_for_position(position) is None:
+                _index, canvas_ids, _photo = self.visible.pop(position)
+                for canvas_id in canvas_ids:
+                    self.canvas.delete(canvas_id)
 
-        cell_width = max(170, width // self.columns)
-        for position in sorted(wanted_positions):
+        rendered = 0
+        for position in sorted(wanted):
             if position in self.visible:
                 continue
             resolved = self._item_for_position(position)
@@ -885,47 +963,34 @@ class VirtualPreviewGrid(ctk.CTkFrame):
                 continue
             index, item = resolved
             try:
-                photo = self.photo_factory(item)
+                photo = self._cached_photo(index, item)
             except Exception:
                 continue
             row, column = divmod(position, self.columns)
-            card = ctk.CTkFrame(
-                self.canvas,
-                width=cell_width - 12,
-                height=self.CELL_HEIGHT - 12,
-                corner_radius=14,
-                fg_color=self.colors["surface"],
-                border_width=1,
-                border_color="#26314E",
+            left = column * self.cell_width + 6
+            top_y = row * self.CELL_HEIGHT + 6
+            right = left + self.cell_width - 12
+            bottom_y = top_y + self.CELL_HEIGHT - 12
+            center_x = (left + right) // 2
+            ids = (
+                self.canvas.create_rectangle(
+                    left, top_y, right, bottom_y,
+                    fill=self.colors["surface"], outline="#26314E", width=1,
+                ),
+                self.canvas.create_image(center_x, top_y + 8, image=photo, anchor="n"),
+                self.canvas.create_text(
+                    center_x, bottom_y - 18,
+                    text=f"{item.character} / {item.situation}  ·  원본 보기",
+                    fill=self.colors["text"],
+                    font=self.label_font,
+                    anchor="center",
+                ),
             )
-            card.grid_propagate(False)
-            image_label = tk.Label(card, image=photo, bg="#151F36", bd=0, highlightthickness=0, cursor="hand2")
-            image_label.image = photo
-            image_label.pack(padx=8, pady=(8, 3))
-            image_label.bind("<Button-1>", lambda _event, value=index: self.on_open(value))
-            button = ctk.CTkButton(
-                card,
-                text=f"{item.character} / {item.situation}  ·  원본 보기",
-                height=28,
-                corner_radius=9,
-                fg_color="#273450",
-                hover_color=self.colors["accent_hover"],
-                font=self.font_factory(10, "bold"),
-                command=lambda value=index: self.on_open(value),
-            )
-            button.pack(fill="x", padx=8, pady=(0, 7))
-            for widget in (card, image_label, button):
-                self._bind_wheel(widget)
-            window_id = self.canvas.create_window(
-                column * cell_width + 6,
-                row * self.CELL_HEIGHT + 6,
-                window=card,
-                width=cell_width - 12,
-                height=self.CELL_HEIGHT - 12,
-                anchor="nw",
-            )
-            self.visible[position] = (window_id, card, photo)
-
+            self.visible[position] = (index, ids, photo)
+            rendered += 1
+            if rendered >= self.RENDER_BATCH_SIZE:
+                self._schedule_redraw()
+                break
 
 class DownloaderApp(ctk.CTk):
     """Desktop-first UI: macOS softness, One UI spacing, Windows 11 clarity."""
@@ -966,7 +1031,7 @@ class DownloaderApp(ctk.CTk):
             self.update_status.configure(text=f"v{APP_VERSION} 업데이트 완료", text_color=self.COLORS["success"])
             self.after(250, lambda: self._write_log(f"업데이트 완료 — Luma Fetch v{APP_VERSION}"))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(35, self._poll_events)
+        self.after(12 if not self.events.empty() else 30, self._poll_events)
 
     def _font(self, size: int, weight: str = "normal") -> ctk.CTkFont:
         return ctk.CTkFont(family="Segoe UI Variable", size=size, weight=weight)
@@ -1433,19 +1498,34 @@ class DownloaderApp(ctk.CTk):
             return
         self.preview_sequence += 1
         sequence = self.preview_sequence
+        previous_cache = getattr(self, "gallery_cache_dir", None)
         self.preview_cancel_event.set()
         self.preview_cancel_event = threading.Event()
+        cache_dir = self.preview_cache_root / f"session-{sequence:08d}"
+        self.gallery_cache_dir = cache_dir
+        if previous_cache:
+            threading.Thread(target=self._cleanup_preview_cache, args=(previous_cache,), daemon=True).start()
         self.gallery_selected_character = character
         for name, button in self.gallery_tab_buttons.items():
             button.configure(fg_color=self.COLORS["accent"] if name == character else "#273450")
         self.events.put(("live_preview_start", (sequence, character, len(self.preview_config.expand_situations()))))
-        threading.Thread(target=self._live_preview_worker, args=(self.preview_config, character, sequence, self.preview_cancel_event), daemon=True).start()
+        threading.Thread(target=self._live_preview_worker, args=(self.preview_config, character, sequence, self.preview_cancel_event, cache_dir), daemon=True).start()
 
-    def _live_preview_worker(self, config: DownloadConfig, character: str, sequence: int, cancelled: threading.Event) -> None:
+    @staticmethod
+    def _cleanup_preview_cache(path: Path) -> None:
+        """Remove a stale session after cancellation without blocking Tk."""
+        waiter = threading.Event()
+        for _ in range(12):
+            shutil.rmtree(path, ignore_errors=True)
+            if not path.exists():
+                return
+            waiter.wait(0.25)
+
+
+    def _live_preview_worker(self, config: DownloadConfig, character: str, sequence: int, cancelled: threading.Event, cache_dir: Path) -> None:
         try:
             def on_item(index: int, item: PreviewImage) -> None:
                 self.events.put(("live_preview_item", (sequence, index, item)))
-            cache_dir = self.preview_cache_root / f"session-{sequence:08d}"
             batch = asyncio.run(fetch_live_previews(config, character, on_item, cancelled, cache_dir))
             self.events.put(("live_preview_done", (sequence, batch)))
         except Exception as error:
@@ -1487,8 +1567,9 @@ class DownloaderApp(ctk.CTk):
         self.gallery_items[index] = item
         self.virtual_gallery.add_item(index, item)
         self.gallery_loaded += 1
-        self.gallery_summary.configure(text=f"{item.character} · 수신 {self.gallery_loaded}장 · 전체 {self.gallery_total}장 요청 중")
-        self.preview.configure(text=f"미리보기 수신 중 · {item.character} {self.gallery_loaded}장")
+        if self.gallery_loaded == 1 or self.gallery_loaded % 8 == 0 or self.gallery_loaded == self.gallery_total:
+            self.gallery_summary.configure(text=f"{item.character} · 수신 {self.gallery_loaded}장 · 전체 {self.gallery_total}장 요청 중")
+            self.preview.configure(text=f"미리보기 수신 중 · {item.character} {self.gallery_loaded}장")
 
     def _finish_preview_batch(self, batch: PreviewBatch) -> None:
         character = getattr(self, "gallery_selected_character", "")
@@ -1677,8 +1758,9 @@ class DownloaderApp(ctk.CTk):
         self.status.configure(text="취소 요청됨 — 진행 중인 연결을 정리합니다…")
 
     def _poll_events(self) -> None:
-        # Keep the Tk event loop responsive even while thousands of previews stream in.
-        for _ in range(12):
+        # Drain bursts quickly, but cap each UI slice so input and scrolling stay responsive.
+        event_budget = 64 if self.events.qsize() > 24 else 16
+        for _ in range(event_budget):
             if self.events.empty():
                 break
             kind, payload = self.events.get_nowait()
@@ -1745,7 +1827,7 @@ class DownloaderApp(ctk.CTk):
                     self._write_log(f"완료 — 성공 {stats.success}, 실패 {stats.failed}, 취소 {stats.cancelled}")
                 else:
                     self.state_badge.configure(text="●  오류", fg_color="#452536", text_color="#FF9CAD"); self._write_log(f"오류: {payload}")
-        self.after(35, self._poll_events)
+        self.after(12 if not self.events.empty() else 30, self._poll_events)
 
     def _write_log(self, message: str) -> None:
         self.log.insert("end", message + "\n"); self.log.see("end")
