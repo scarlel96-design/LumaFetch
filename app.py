@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.12.2"
+APP_VERSION = "1.12.3"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -44,6 +44,9 @@ MAX_UPDATE_INSTALLER_BYTES = 150 * 1024 * 1024
 FAVORITES_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LumaFetch" / "favorites.json"
 MAX_FAVORITES = 1000
 FAVORITES_PAGE_SIZE = 30
+MAX_CHARACTER_CODES = 1000
+MAX_CHARACTER_CODE_LENGTH = 120
+MAX_CHARACTER_LIST_LENGTH = 131_072
 def runtime_asset(name: str) -> Path:
     """Return a bundled PyInstaller asset or its source-tree equivalent."""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -154,7 +157,7 @@ class DownloadConfig(BaseModel):
     """
 
     template_url: str
-    character: str = Field(min_length=1, max_length=64)
+    character: str = Field(min_length=1, max_length=MAX_CHARACTER_LIST_LENGTH)
     ranges: str = Field(min_length=1)
     outfit: str = "X"
     destination: Path
@@ -184,6 +187,10 @@ class DownloadConfig(BaseModel):
         codes = [code.strip() for code in value.split(",") if code.strip()]
         if not codes:
             raise ValueError("캐릭터 코드를 하나 이상 입력하세요.")
+        if len(codes) > MAX_CHARACTER_CODES:
+            raise ValueError(f"캐릭터 코드는 최대 {MAX_CHARACTER_CODES:,}개까지 입력할 수 있습니다.")
+        if any(len(code) > MAX_CHARACTER_CODE_LENGTH for code in codes):
+            raise ValueError(f"각 캐릭터 코드는 최대 {MAX_CHARACTER_CODE_LENGTH}자까지 입력할 수 있습니다.")
         if any(code in {".", ".."} for code in codes):
             raise ValueError("캐릭터 코드로 . 또는 ..은 사용할 수 없습니다.")
         if any(any(char in code for char in r'\\/:*?"<>|') for code in codes):
