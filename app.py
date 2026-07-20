@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.12.3"
+APP_VERSION = "1.12.4"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -1089,6 +1089,7 @@ class DownloaderApp(ctk.CTk):
         self.entry_vars: dict[str, ctk.StringVar] = {}
         self.preview_after_id: str | None = None
         self.preview_updates_suspended = False
+        self.validation_error_active = False
         self.preview_sequence = 0
         self.preview_photo: tk.PhotoImage | None = None
         self.preview_cancel_event = threading.Event()
@@ -1183,8 +1184,20 @@ class DownloaderApp(ctk.CTk):
         preview_row = ctk.CTkFrame(form, fg_color="transparent")
         preview_row.grid(row=4, column=0, columnspan=2, padx=18, pady=(4, 2), sticky="ew")
         preview_row.grid_columnconfigure(0, weight=1)
-        self.preview = ctk.CTkLabel(preview_row, text="설정을 입력한 뒤 미리보기 버튼을 누르세요.", text_color="#AAB7D8", font=self._font(10), justify="left", wraplength=680)
-        self.preview.grid(row=0, column=0, sticky="w")
+        self.preview = ctk.CTkLabel(
+            preview_row,
+            text="설정을 입력한 뒤 미리보기 버튼을 누르세요.",
+            text_color="#AAB7D8",
+            fg_color="transparent",
+            corner_radius=10,
+            font=self._font(10),
+            justify="left",
+            anchor="w",
+            wraplength=680,
+            padx=10,
+            pady=5,
+        )
+        self.preview.grid(row=0, column=0, sticky="ew")
         input_help = (
             "캐릭터 코드는 쉼표(,)로 구분하고, 상황 범위는 1..10 형식으로 입력하세요.\n"
             "템플릿 URL에서 코드가 들어갈 위치는 캐릭터 · 의상 · 상황 키워드로 채우세요."
@@ -1517,6 +1530,8 @@ class DownloaderApp(ctk.CTk):
     def _trace_preview_update(self) -> None:
         """Ignore programmatic favorite loads while preserving normal live validation."""
         if not self.preview_updates_suspended:
+            self.validation_error_active = False
+            self.preview.configure(fg_color="transparent", text_color="#AAB7D8")
             self._invalidate_preview_session()
             self._queue_preview_update()
 
@@ -1552,15 +1567,20 @@ class DownloaderApp(ctk.CTk):
             destination=Path.cwd(),
         )
 
-    def _clear_live_preview(self, message: str) -> None:
+    def _clear_live_preview(self, message: str, *, error: bool = False) -> None:
         self.preview_photo = None
-        self.preview.configure(text=message)
+        self.preview.configure(
+            text=message,
+            fg_color="#3B2133" if error else "transparent",
+            text_color="#FFADC0" if error else "#AAB7D8",
+        )
 
     @staticmethod
     def _input_error_message(error: ValidationError | ValueError) -> str:
         if isinstance(error, ValidationError) and (issues := error.errors(include_url=False)):
             issue = issues[0]
-            field = str(issue.get("loc", ("입력",))[0])
+            location = issue.get("loc") or ("입력",)
+            field = str(location[0])
             label = {
                 "template_url": "템플릿 URL", "character": "캐릭터 코드",
                 "ranges": "상황 코드 범위", "outfit": "의상 코드",
@@ -1571,20 +1591,32 @@ class DownloaderApp(ctk.CTk):
             return f"{label}: {message}"
         return str(error)
 
-    def _show_input_error(self, action: str, error: ValidationError | ValueError) -> None:
+    def _show_input_error(
+        self,
+        action: str,
+        error: ValidationError | ValueError,
+        *,
+        write_log: bool = True,
+    ) -> None:
         message = self._input_error_message(error)
-        self._clear_live_preview(f"{action} 불가 · {message}")
+        self.validation_error_active = True
+        self._clear_live_preview(f"{action} 불가 · {message}", error=True)
         self.state_badge.configure(text="●  입력 확인", fg_color="#452536", text_color="#FF9CAD")
-        self._write_log(f"{action} 입력 오류: {message}")
+        if write_log:
+            self._write_log(f"{action} 입력 오류: {message}")
 
     def _update_preview(self, _event: object | None = None) -> None:
         """Refresh validation text after the request session was invalidated immediately."""
         self.preview_after_id = None
+        if self.validation_error_active:
+            return
         try:
             self._preview_config()
-        except (ValidationError, ValueError):
-            self._clear_live_preview("템플릿 · 캐릭터 코드 · 상황 범위를 입력한 뒤 미리보기를 누르세요.")
+        except (ValidationError, ValueError) as error:
+            self._show_input_error("입력", error, write_log=False)
             return
+        self.validation_error_active = False
+        self.state_badge.configure(text="●  준비됨", fg_color="#16372D", text_color=self.COLORS["success"])
         self._clear_live_preview("설정 준비됨 · ▦ 미리보기 버튼을 눌러 캐릭터를 선택하세요.")
 
     def _manual_preview(self) -> None:
@@ -1598,6 +1630,8 @@ class DownloaderApp(ctk.CTk):
         except (ValidationError, ValueError) as error:
             self._show_input_error("미리보기", error)
             return
+        self.validation_error_active = False
+        self.state_badge.configure(text="●  준비됨", fg_color="#16372D", text_color=self.COLORS["success"])
         self.preview_sequence += 1
         sequence = self.preview_sequence
         self.preview_cancel_event.set()
@@ -2128,6 +2162,8 @@ class DownloaderApp(ctk.CTk):
             self.folder_var.set(favorite.destination or "")
         finally:
             self.preview_updates_suspended = False
+        self.validation_error_active = False
+        self.preview.configure(fg_color="transparent", text_color="#AAB7D8")
         self._write_log(f"즐겨찾기 불러옴: {favorite.name}")
 
     def _save_current_favorite(self) -> None:
