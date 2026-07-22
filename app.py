@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.12.8"
+APP_VERSION = "1.12.9"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -253,19 +253,35 @@ class DownloadConfig(BaseModel):
     @field_validator("character")
     @classmethod
     def normalize_characters(cls, value: str) -> str:
-        codes = [code.strip() for code in value.split(",") if code.strip()]
-        if not codes:
+        raw_codes = [code.strip() for code in value.split(",") if code.strip()]
+        if not raw_codes:
             raise ValueError("캐릭터 코드를 하나 이상 입력하세요.")
+
+        values: dict[str, None] = {}
+        for code in raw_codes:
+            if match := re.fullmatch(r"(.+?)(\d+)\s*\.\.\s*(\d+)", code):
+                prefix, start_text, end_text = match.groups()
+                start, end = int(start_text), int(end_text)
+                if start > end:
+                    raise ValueError(f"잘못된 캐릭터 범위: {code}")
+                if end - start + 1 > MAX_CHARACTER_CODES:
+                    raise ValueError(f"한 캐릭터 범위는 최대 {MAX_CHARACTER_CODES:,}개까지 가능합니다.")
+                width = max(len(start_text), len(end_text)) if start_text.startswith("0") or end_text.startswith("0") else 0
+                for number in range(start, end + 1):
+                    values.setdefault(f"{prefix}{number:0{width}d}", None)
+            else:
+                values.setdefault(code, None)
+
+        codes = list(values)
         if len(codes) > MAX_CHARACTER_CODES:
             raise ValueError(f"캐릭터 코드는 최대 {MAX_CHARACTER_CODES:,}개까지 입력할 수 있습니다.")
         if any(len(code) > MAX_CHARACTER_CODE_LENGTH for code in codes):
             raise ValueError(f"각 캐릭터 코드는 최대 {MAX_CHARACTER_CODE_LENGTH}자까지 입력할 수 있습니다.")
         if any(code in {".", ".."} for code in codes):
             raise ValueError("캐릭터 코드로 . 또는 ..은 사용할 수 없습니다.")
-        if any(any(char in code for char in r'\\/:*?"<>|') for code in codes):
+        if any(any(char in code for char in r'\/:*?"<>|') for code in codes):
             raise ValueError("캐릭터 코드에는 파일명에 사용할 수 없는 문자를 쓸 수 없습니다.")
-        return ",".join(dict.fromkeys(codes))
-
+        return ",".join(codes)
     @field_validator("outfit")
     @classmethod
     def normalize_outfit(cls, value: str) -> str:
@@ -1262,7 +1278,7 @@ class DownloaderApp(ctk.CTk):
         form.grid(row=1, column=0, sticky="ew")
         form.grid_columnconfigure((0, 1), weight=1)
         self._entry(form, "템플릿 URL", "치환 토큰: 캐릭터 · 상황 · 의상", 0, 0, span=2)
-        self._entry(form, "캐릭터 코드", "쉼표로 여러 코드", 1, 0)
+        self._entry(form, "캐릭터 코드", "쉼표로 구분 · A1..7 가능", 1, 0)
         self._entry(form, "의상 코드", "공란 = X", 1, 1)
         self._entry(form, "상황 코드 범위", "1, 2..70 또는 0001..0500", 2, 0)
         self._entry(form, "동시 다운로드", "공란 = 20", 2, 1)
@@ -1285,7 +1301,7 @@ class DownloaderApp(ctk.CTk):
         )
         self.preview.grid(row=0, column=0, sticky="ew")
         input_help = (
-            "캐릭터 코드는 쉼표(,)로 구분하고, 상황 코드는 1 또는 1..10 형식으로 입력하세요.\n"
+            "캐릭터 코드는 A1..7 또는 쉼표(,)로 구분하고, 상황 코드는 1 또는 1..10 형식으로 입력하세요.\n"
             "템플릿 URL에서 코드가 들어갈 위치는 캐릭터 · 의상 · 상황 키워드로 채우세요."
         )
         ctk.CTkLabel(
