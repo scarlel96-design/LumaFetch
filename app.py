@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.12.7"
+APP_VERSION = "1.12.8"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -287,14 +287,17 @@ class DownloadConfig(BaseModel):
     def expand_situations(self) -> list[str]:
         values: dict[str, None] = {}
         for part in self.ranges.split(","):
-            match = RANGE_PATTERN.fullmatch(part)
-            if not match:
-                raise ValueError("범위는 0001..0500, 1001..1420처럼 쉼표로 구분하세요.")
+            code = part.strip()
+            if code.isdecimal():
+                values.setdefault(code, None)
+                continue
+            if not (match := RANGE_PATTERN.fullmatch(part)):
+                raise ValueError("상황 코드는 1 또는 0001..0500처럼 쉼표로 구분하세요.")
             start_text, end_text = match.groups()
             start, end = int(start_text), int(end_text)
             if start > end:
-                raise ValueError(f"잘못된 범위: {part.strip()}")
-            width = max(len(start_text), len(end_text))
+                raise ValueError(f"잘못된 범위: {code}")
+            width = max(len(start_text), len(end_text)) if start_text.startswith("0") or end_text.startswith("0") else 0
             if end - start > 100_000:
                 raise ValueError("한 범위는 최대 100,001개까지 가능합니다.")
             for number in range(start, end + 1):
@@ -1261,7 +1264,7 @@ class DownloaderApp(ctk.CTk):
         self._entry(form, "템플릿 URL", "치환 토큰: 캐릭터 · 상황 · 의상", 0, 0, span=2)
         self._entry(form, "캐릭터 코드", "쉼표로 여러 코드", 1, 0)
         self._entry(form, "의상 코드", "공란 = X", 1, 1)
-        self._entry(form, "상황 코드 범위", "시작..끝, 시작..끝", 2, 0)
+        self._entry(form, "상황 코드 범위", "1, 2..70 또는 0001..0500", 2, 0)
         self._entry(form, "동시 다운로드", "공란 = 20", 2, 1)
         self._entry(form, "Referer", "필요 시 원본 페이지 주소", 3, 0, span=2)
         preview_row = ctk.CTkFrame(form, fg_color="transparent")
@@ -1282,7 +1285,7 @@ class DownloaderApp(ctk.CTk):
         )
         self.preview.grid(row=0, column=0, sticky="ew")
         input_help = (
-            "캐릭터 코드는 쉼표(,)로 구분하고, 상황 범위는 1..10 형식으로 입력하세요.\n"
+            "캐릭터 코드는 쉼표(,)로 구분하고, 상황 코드는 1 또는 1..10 형식으로 입력하세요.\n"
             "템플릿 URL에서 코드가 들어갈 위치는 캐릭터 · 의상 · 상황 키워드로 채우세요."
         )
         ctk.CTkLabel(
