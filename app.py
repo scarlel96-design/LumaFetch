@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.12.4"
+APP_VERSION = "1.12.6"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -73,6 +73,7 @@ IMAGE_BROWSER_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
 )
+AUTO_REFERER_CANDIDATES = ("https://si-ran.com/",)
 
 
 def make_request_headers(referer: str | None) -> dict[str, str]:
@@ -89,6 +90,74 @@ def make_request_headers(referer: str | None) -> dict[str, str]:
     if referer:
         headers["Referer"] = referer
     return headers
+
+
+class ImageRequestPolicy:
+    """Resolve a hotlink Referer once per host, then reuse it for the batch."""
+
+    def __init__(
+        self,
+        explicit_referer: str | None,
+        on_detected: Callable[[str, str], None] | None = None,
+    ) -> None:
+        self.explicit_referer = explicit_referer
+        self.on_detected = on_detected
+        self._resolved: dict[str, str | None] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    def _referer_headers(referer: str | None) -> dict[str, str] | None:
+        return {"Referer": referer} if referer else None
+
+    async def get(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        **kwargs: object,
+    ) -> aiohttp.ClientResponse:
+        if self.explicit_referer:
+            return await session.get(
+                url,
+                headers=self._referer_headers(self.explicit_referer),
+                **kwargs,
+            )
+
+        host = (urlparse(url).hostname or "").casefold()
+        if host in self._resolved:
+            return await session.get(
+                url,
+                headers=self._referer_headers(self._resolved[host]),
+                **kwargs,
+            )
+
+        lock = self._locks.setdefault(host, asyncio.Lock())
+        async with lock:
+            if host in self._resolved:
+                return await session.get(
+                    url,
+                    headers=self._referer_headers(self._resolved[host]),
+                    **kwargs,
+                )
+
+            candidates: tuple[str | None, ...] = (None, *AUTO_REFERER_CANDIDATES)
+            saw_forbidden = False
+            for index, referer in enumerate(candidates):
+                response = await session.get(
+                    url,
+                    headers=self._referer_headers(referer),
+                    **kwargs,
+                )
+                if response.status == 403 and index < len(candidates) - 1:
+                    saw_forbidden = True
+                    response.release()
+                    continue
+
+                self._resolved[host] = referer
+                if saw_forbidden and referer and response.status != 403 and self.on_detected:
+                    self.on_detected(host, referer)
+                return response
+
+        raise RuntimeError("이미지 요청 정책이 응답을 선택하지 못했습니다.")
 
 
 class SecurityGuard:
@@ -561,7 +630,8 @@ async def fetch_live_previews(
         resolver=PublicResolver(),
     )
     timeout = aiohttp.ClientTimeout(total=25, connect=10, sock_read=18)
-    headers = make_request_headers(config.referer)
+    headers = make_request_headers(None)
+    request_policy = ImageRequestPolicy(config.referer)
     next_index = 0
     index_lock = asyncio.Lock()
     success = 0
@@ -588,7 +658,8 @@ async def fetch_live_previews(
                 return None, None
             url = probe.make_url(character, candidate)
             try:
-                async with session.get(url, allow_redirects=False) as response:
+                response = await request_policy.get(session, url, allow_redirects=False)
+                async with response:
                     if response.status == 404:
                         last_error = aiohttp.ClientResponseError(response.request_info, response.history, status=404)
                         continue
@@ -692,7 +763,8 @@ async def fetch_preview_covers(
     semaphore = asyncio.Semaphore(4)
     connector = aiohttp.TCPConnector(limit=4, limit_per_host=4, ttl_dns_cache=300, resolver=PublicResolver())
     timeout = aiohttp.ClientTimeout(total=20, connect=8, sock_read=15)
-    headers = make_request_headers(config.referer)
+    headers = make_request_headers(None)
+    request_policy = ImageRequestPolicy(config.referer)
 
     async def one(session: aiohttp.ClientSession, character: str) -> None:
         async with semaphore:
@@ -702,7 +774,8 @@ async def fetch_preview_covers(
                         return
                     url = probe.make_url(character, candidate)
                     try:
-                        async with session.get(url, allow_redirects=False) as response:
+                        response = await request_policy.get(session, url, allow_redirects=False)
+                        async with response:
                             if response.status != 200 or not response.content_type.startswith("image/"):
                                 continue
                             data = await read_image_response(response)
@@ -722,6 +795,13 @@ class Downloader:
         self.config = config
         self.cancelled = cancelled
         self.notify = notify
+        self.request_policy = ImageRequestPolicy(
+            config.referer,
+            lambda host, referer: self.notify(
+                "log",
+                f"403 자동 대응 · {host} 요청에 Referer {referer} 적용",
+            ),
+        )
         self.stats = DownloadStats(total=len(config.expand_characters()) * len(config.expand_situations()))
         self.defender = SecurityGuard.defender_executable() if config.scan_with_defender else None
 
@@ -764,7 +844,8 @@ class Downloader:
                     if self.cancelled.is_set():
                         return "cancelled"
                     try:
-                        async with session.get(url, allow_redirects=False) as response:
+                        response = await self.request_policy.get(session, url, allow_redirects=False)
+                        async with response:
                             if response.status == 404:
                                 last_error = aiohttp.ClientResponseError(
                                     response.request_info, response.history, status=response.status
@@ -815,7 +896,7 @@ class Downloader:
             ttl_dns_cache=300, enable_cleanup_closed=True, resolver=PublicResolver(),
         )
         timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=45)
-        headers = make_request_headers(self.config.referer)
+        headers = make_request_headers(None)
         progress = Progress(SpinnerColumn(), TextColumn("다운로드"), BarColumn(), "{task.completed}/{task.total}", TimeRemainingColumn())
         worker_count = self.config.concurrency
         work_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue(maxsize=worker_count * 2)
@@ -1643,7 +1724,11 @@ class DownloaderApp(ctk.CTk):
             args=(config, sequence, self.preview_cancel_event),
             daemon=True,
         ).start()
-        referer_state = f"Referer 적용: {urlparse(config.referer).netloc}" if config.referer else "Referer 없이 요청"
+        referer_state = (
+            f"Referer 적용: {urlparse(config.referer).netloc}"
+            if config.referer
+            else "Referer 자동 감지(403 대응)"
+        )
         self.preview.configure(text=f"캐릭터를 선택하면 전체 이미지를 불러옵니다. · {referer_state}")
 
     def _ensure_preview_gallery(self) -> None:
