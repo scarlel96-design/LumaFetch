@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.12.3"
+APP_VERSION = "1.12.6"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -73,6 +73,7 @@ IMAGE_BROWSER_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
 )
+AUTO_REFERER_CANDIDATES = ("https://si-ran.com/",)
 
 
 def make_request_headers(referer: str | None) -> dict[str, str]:
@@ -89,6 +90,74 @@ def make_request_headers(referer: str | None) -> dict[str, str]:
     if referer:
         headers["Referer"] = referer
     return headers
+
+
+class ImageRequestPolicy:
+    """Resolve a hotlink Referer once per host, then reuse it for the batch."""
+
+    def __init__(
+        self,
+        explicit_referer: str | None,
+        on_detected: Callable[[str, str], None] | None = None,
+    ) -> None:
+        self.explicit_referer = explicit_referer
+        self.on_detected = on_detected
+        self._resolved: dict[str, str | None] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    @staticmethod
+    def _referer_headers(referer: str | None) -> dict[str, str] | None:
+        return {"Referer": referer} if referer else None
+
+    async def get(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        **kwargs: object,
+    ) -> aiohttp.ClientResponse:
+        if self.explicit_referer:
+            return await session.get(
+                url,
+                headers=self._referer_headers(self.explicit_referer),
+                **kwargs,
+            )
+
+        host = (urlparse(url).hostname or "").casefold()
+        if host in self._resolved:
+            return await session.get(
+                url,
+                headers=self._referer_headers(self._resolved[host]),
+                **kwargs,
+            )
+
+        lock = self._locks.setdefault(host, asyncio.Lock())
+        async with lock:
+            if host in self._resolved:
+                return await session.get(
+                    url,
+                    headers=self._referer_headers(self._resolved[host]),
+                    **kwargs,
+                )
+
+            candidates: tuple[str | None, ...] = (None, *AUTO_REFERER_CANDIDATES)
+            saw_forbidden = False
+            for index, referer in enumerate(candidates):
+                response = await session.get(
+                    url,
+                    headers=self._referer_headers(referer),
+                    **kwargs,
+                )
+                if response.status == 403 and index < len(candidates) - 1:
+                    saw_forbidden = True
+                    response.release()
+                    continue
+
+                self._resolved[host] = referer
+                if saw_forbidden and referer and response.status != 403 and self.on_detected:
+                    self.on_detected(host, referer)
+                return response
+
+        raise RuntimeError("이미지 요청 정책이 응답을 선택하지 못했습니다.")
 
 
 class SecurityGuard:
@@ -561,7 +630,8 @@ async def fetch_live_previews(
         resolver=PublicResolver(),
     )
     timeout = aiohttp.ClientTimeout(total=25, connect=10, sock_read=18)
-    headers = make_request_headers(config.referer)
+    headers = make_request_headers(None)
+    request_policy = ImageRequestPolicy(config.referer)
     next_index = 0
     index_lock = asyncio.Lock()
     success = 0
@@ -588,7 +658,8 @@ async def fetch_live_previews(
                 return None, None
             url = probe.make_url(character, candidate)
             try:
-                async with session.get(url, allow_redirects=False) as response:
+                response = await request_policy.get(session, url, allow_redirects=False)
+                async with response:
                     if response.status == 404:
                         last_error = aiohttp.ClientResponseError(response.request_info, response.history, status=404)
                         continue
@@ -692,7 +763,8 @@ async def fetch_preview_covers(
     semaphore = asyncio.Semaphore(4)
     connector = aiohttp.TCPConnector(limit=4, limit_per_host=4, ttl_dns_cache=300, resolver=PublicResolver())
     timeout = aiohttp.ClientTimeout(total=20, connect=8, sock_read=15)
-    headers = make_request_headers(config.referer)
+    headers = make_request_headers(None)
+    request_policy = ImageRequestPolicy(config.referer)
 
     async def one(session: aiohttp.ClientSession, character: str) -> None:
         async with semaphore:
@@ -702,7 +774,8 @@ async def fetch_preview_covers(
                         return
                     url = probe.make_url(character, candidate)
                     try:
-                        async with session.get(url, allow_redirects=False) as response:
+                        response = await request_policy.get(session, url, allow_redirects=False)
+                        async with response:
                             if response.status != 200 or not response.content_type.startswith("image/"):
                                 continue
                             data = await read_image_response(response)
@@ -722,6 +795,13 @@ class Downloader:
         self.config = config
         self.cancelled = cancelled
         self.notify = notify
+        self.request_policy = ImageRequestPolicy(
+            config.referer,
+            lambda host, referer: self.notify(
+                "log",
+                f"403 자동 대응 · {host} 요청에 Referer {referer} 적용",
+            ),
+        )
         self.stats = DownloadStats(total=len(config.expand_characters()) * len(config.expand_situations()))
         self.defender = SecurityGuard.defender_executable() if config.scan_with_defender else None
 
@@ -764,7 +844,8 @@ class Downloader:
                     if self.cancelled.is_set():
                         return "cancelled"
                     try:
-                        async with session.get(url, allow_redirects=False) as response:
+                        response = await self.request_policy.get(session, url, allow_redirects=False)
+                        async with response:
                             if response.status == 404:
                                 last_error = aiohttp.ClientResponseError(
                                     response.request_info, response.history, status=response.status
@@ -815,7 +896,7 @@ class Downloader:
             ttl_dns_cache=300, enable_cleanup_closed=True, resolver=PublicResolver(),
         )
         timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=45)
-        headers = make_request_headers(self.config.referer)
+        headers = make_request_headers(None)
         progress = Progress(SpinnerColumn(), TextColumn("다운로드"), BarColumn(), "{task.completed}/{task.total}", TimeRemainingColumn())
         worker_count = self.config.concurrency
         work_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue(maxsize=worker_count * 2)
@@ -1089,6 +1170,7 @@ class DownloaderApp(ctk.CTk):
         self.entry_vars: dict[str, ctk.StringVar] = {}
         self.preview_after_id: str | None = None
         self.preview_updates_suspended = False
+        self.validation_error_active = False
         self.preview_sequence = 0
         self.preview_photo: tk.PhotoImage | None = None
         self.preview_cancel_event = threading.Event()
@@ -1183,8 +1265,20 @@ class DownloaderApp(ctk.CTk):
         preview_row = ctk.CTkFrame(form, fg_color="transparent")
         preview_row.grid(row=4, column=0, columnspan=2, padx=18, pady=(4, 2), sticky="ew")
         preview_row.grid_columnconfigure(0, weight=1)
-        self.preview = ctk.CTkLabel(preview_row, text="설정을 입력한 뒤 미리보기 버튼을 누르세요.", text_color="#AAB7D8", font=self._font(10), justify="left", wraplength=680)
-        self.preview.grid(row=0, column=0, sticky="w")
+        self.preview = ctk.CTkLabel(
+            preview_row,
+            text="설정을 입력한 뒤 미리보기 버튼을 누르세요.",
+            text_color="#AAB7D8",
+            fg_color="transparent",
+            corner_radius=10,
+            font=self._font(10),
+            justify="left",
+            anchor="w",
+            wraplength=680,
+            padx=10,
+            pady=5,
+        )
+        self.preview.grid(row=0, column=0, sticky="ew")
         input_help = (
             "캐릭터 코드는 쉼표(,)로 구분하고, 상황 범위는 1..10 형식으로 입력하세요.\n"
             "템플릿 URL에서 코드가 들어갈 위치는 캐릭터 · 의상 · 상황 키워드로 채우세요."
@@ -1517,6 +1611,8 @@ class DownloaderApp(ctk.CTk):
     def _trace_preview_update(self) -> None:
         """Ignore programmatic favorite loads while preserving normal live validation."""
         if not self.preview_updates_suspended:
+            self.validation_error_active = False
+            self.preview.configure(fg_color="transparent", text_color="#AAB7D8")
             self._invalidate_preview_session()
             self._queue_preview_update()
 
@@ -1552,15 +1648,20 @@ class DownloaderApp(ctk.CTk):
             destination=Path.cwd(),
         )
 
-    def _clear_live_preview(self, message: str) -> None:
+    def _clear_live_preview(self, message: str, *, error: bool = False) -> None:
         self.preview_photo = None
-        self.preview.configure(text=message)
+        self.preview.configure(
+            text=message,
+            fg_color="#3B2133" if error else "transparent",
+            text_color="#FFADC0" if error else "#AAB7D8",
+        )
 
     @staticmethod
     def _input_error_message(error: ValidationError | ValueError) -> str:
         if isinstance(error, ValidationError) and (issues := error.errors(include_url=False)):
             issue = issues[0]
-            field = str(issue.get("loc", ("입력",))[0])
+            location = issue.get("loc") or ("입력",)
+            field = str(location[0])
             label = {
                 "template_url": "템플릿 URL", "character": "캐릭터 코드",
                 "ranges": "상황 코드 범위", "outfit": "의상 코드",
@@ -1571,20 +1672,32 @@ class DownloaderApp(ctk.CTk):
             return f"{label}: {message}"
         return str(error)
 
-    def _show_input_error(self, action: str, error: ValidationError | ValueError) -> None:
+    def _show_input_error(
+        self,
+        action: str,
+        error: ValidationError | ValueError,
+        *,
+        write_log: bool = True,
+    ) -> None:
         message = self._input_error_message(error)
-        self._clear_live_preview(f"{action} 불가 · {message}")
+        self.validation_error_active = True
+        self._clear_live_preview(f"{action} 불가 · {message}", error=True)
         self.state_badge.configure(text="●  입력 확인", fg_color="#452536", text_color="#FF9CAD")
-        self._write_log(f"{action} 입력 오류: {message}")
+        if write_log:
+            self._write_log(f"{action} 입력 오류: {message}")
 
     def _update_preview(self, _event: object | None = None) -> None:
         """Refresh validation text after the request session was invalidated immediately."""
         self.preview_after_id = None
+        if self.validation_error_active:
+            return
         try:
             self._preview_config()
-        except (ValidationError, ValueError):
-            self._clear_live_preview("템플릿 · 캐릭터 코드 · 상황 범위를 입력한 뒤 미리보기를 누르세요.")
+        except (ValidationError, ValueError) as error:
+            self._show_input_error("입력", error, write_log=False)
             return
+        self.validation_error_active = False
+        self.state_badge.configure(text="●  준비됨", fg_color="#16372D", text_color=self.COLORS["success"])
         self._clear_live_preview("설정 준비됨 · ▦ 미리보기 버튼을 눌러 캐릭터를 선택하세요.")
 
     def _manual_preview(self) -> None:
@@ -1598,6 +1711,8 @@ class DownloaderApp(ctk.CTk):
         except (ValidationError, ValueError) as error:
             self._show_input_error("미리보기", error)
             return
+        self.validation_error_active = False
+        self.state_badge.configure(text="●  준비됨", fg_color="#16372D", text_color=self.COLORS["success"])
         self.preview_sequence += 1
         sequence = self.preview_sequence
         self.preview_cancel_event.set()
@@ -1609,7 +1724,11 @@ class DownloaderApp(ctk.CTk):
             args=(config, sequence, self.preview_cancel_event),
             daemon=True,
         ).start()
-        referer_state = f"Referer 적용: {urlparse(config.referer).netloc}" if config.referer else "Referer 없이 요청"
+        referer_state = (
+            f"Referer 적용: {urlparse(config.referer).netloc}"
+            if config.referer
+            else "Referer 자동 감지(403 대응)"
+        )
         self.preview.configure(text=f"캐릭터를 선택하면 전체 이미지를 불러옵니다. · {referer_state}")
 
     def _ensure_preview_gallery(self) -> None:
@@ -2128,6 +2247,8 @@ class DownloaderApp(ctk.CTk):
             self.folder_var.set(favorite.destination or "")
         finally:
             self.preview_updates_suspended = False
+        self.validation_error_active = False
+        self.preview.configure(fg_color="transparent", text_color="#AAB7D8")
         self._write_log(f"즐겨찾기 불러옴: {favorite.name}")
 
     def _save_current_favorite(self) -> None:
