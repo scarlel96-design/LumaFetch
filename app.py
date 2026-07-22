@@ -35,7 +35,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRe
 
 
 RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.12.6"
+APP_VERSION = "1.12.7"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -1181,6 +1181,7 @@ class DownloaderApp(ctk.CTk):
         self.viewer_photo: tk.PhotoImage | None = None
         self.update_checking = False
         self.favorites = load_favorites()
+        self.editing_favorite_name: str | None = None
         self._build()
         if "--update-complete" in sys.argv:
             self.update_status.configure(text=f"v{APP_VERSION} 업데이트 완료", text_color=self.COLORS["success"])
@@ -1250,6 +1251,7 @@ class DownloaderApp(ctk.CTk):
         self.preview_button.pack(side="right", padx=(0, 8))
         self.favorite_save_button = ctk.CTkButton(action_bar, text="☆  즐겨찾기", width=98, height=38, corner_radius=13, fg_color="#273450", hover_color="#334364", font=self._font(11, "bold"), command=self._save_current_favorite)
         self.favorite_save_button.pack(side="right", padx=(0, 8))
+        self.favorite_edit_cancel_button = ctk.CTkButton(action_bar, text="수정 취소", width=76, height=38, corner_radius=13, fg_color="#342133", hover_color="#49283C", text_color="#FFB3C0", font=self._font(10, "bold"), command=self._cancel_favorite_edit)
         self.state_badge = ctk.CTkLabel(header, text="●  준비됨", corner_radius=14, fg_color="#16372D", text_color=self.COLORS["success"], font=self._font(10, "bold"), padx=10, pady=5)
         self.state_badge.grid(row=2, column=1, sticky="e", pady=(5, 0))
 
@@ -1304,8 +1306,10 @@ class DownloaderApp(ctk.CTk):
         options.grid(row=1, column=1, columnspan=3, padx=(0, 14), pady=(0, 10), sticky="w")
         self.separate_folders_var = ctk.BooleanVar(value=False)
         self.defender_scan_var = ctk.BooleanVar(value=False)
+        self.fixed_destination_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(options, text="캐릭터별 하위 폴더", variable=self.separate_folders_var, checkbox_width=17, checkbox_height=17, font=self._font(11), text_color="#C9D4F3").pack(side="left", padx=(0, 16))
-        ctk.CTkCheckBox(options, text="Defender 검사 요청 (느림)", variable=self.defender_scan_var, checkbox_width=17, checkbox_height=17, font=self._font(11), text_color="#C9D4F3").pack(side="left")
+        ctk.CTkCheckBox(options, text="Defender 검사 (느림)", variable=self.defender_scan_var, checkbox_width=17, checkbox_height=17, font=self._font(11), text_color="#C9D4F3").pack(side="left", padx=(0, 16))
+        ctk.CTkCheckBox(options, text="즐겨찾기 저장 위치 고정", variable=self.fixed_destination_var, checkbox_width=17, checkbox_height=17, font=self._font(11), text_color="#C9D4F3").pack(side="left")
 
         status = self._card(main)
         status.grid(row=3, column=0, sticky="ew")
@@ -1392,10 +1396,26 @@ class DownloaderApp(ctk.CTk):
         self.favorite_page = max(0, self.favorite_page + offset)
         self._render_favorites()
 
-    def _load_favorite_to_form(self, favorite: FavoritePreset) -> None:
+    def _edit_favorite(self, favorite: FavoritePreset) -> None:
         self._apply_favorite(favorite)
+        self.editing_favorite_name = favorite.name
         self._show_main_view("download")
-        self._clear_live_preview("즐겨찾기 설정을 불러왔습니다. 미리보기 또는 다운로드를 누르세요.")
+        self.favorite_save_button.configure(text="✓  수정 저장", fg_color=self.COLORS["accent"])
+        self.favorite_edit_cancel_button.pack(side="right", padx=(0, 8), before=self.favorite_save_button)
+        self.state_badge.configure(text="●  즐겨찾기 수정", fg_color="#302C58", text_color="#C9D0FF")
+        self._clear_live_preview(f"수정 중 · {favorite.name} · 값을 바꾼 뒤 수정 저장을 누르세요.")
+
+    def _cancel_favorite_edit(self, *, announce: bool = True) -> None:
+        if self.editing_favorite_name is None:
+            return
+        name = self.editing_favorite_name
+        self.editing_favorite_name = None
+        self.favorite_save_button.configure(text="☆  즐겨찾기", fg_color="#273450")
+        self.favorite_edit_cancel_button.pack_forget()
+        if not self.running:
+            self.state_badge.configure(text="●  준비됨", fg_color="#16372D", text_color=self.COLORS["success"])
+        if announce:
+            self._clear_live_preview(f"즐겨찾기 수정 취소 · {name}")
 
     def _check_for_updates(self) -> None:
         if self.update_checking:
@@ -2226,7 +2246,7 @@ class DownloaderApp(ctk.CTk):
             ctk.CTkLabel(card, text=details, anchor="w", justify="left", wraplength=320, font=self._font(10), text_color="#AAB7D8").grid(row=2, column=0, columnspan=4, padx=13, pady=(2, 8), sticky="ew")
             ctk.CTkButton(card, text="미리보기", height=29, corner_radius=9, fg_color=self.COLORS["accent"], hover_color=self.COLORS["accent_hover"], font=self._font(9, "bold"), command=lambda value=favorite: self._preview_favorite(value)).grid(row=3, column=0, padx=(10, 4), pady=(0, 10), sticky="ew")
             ctk.CTkButton(card, text="다운로드", height=29, corner_radius=9, fg_color="#273450", hover_color="#334364", font=self._font(9, "bold"), command=lambda value=favorite: self._download_favorite(value)).grid(row=3, column=1, padx=4, pady=(0, 10), sticky="ew")
-            ctk.CTkButton(card, text="불러오기", height=29, corner_radius=9, fg_color="#273450", hover_color="#334364", font=self._font(9), command=lambda value=favorite: self._load_favorite_to_form(value)).grid(row=3, column=2, padx=4, pady=(0, 10), sticky="ew")
+            ctk.CTkButton(card, text="수정", height=29, corner_radius=9, fg_color="#273450", hover_color="#334364", font=self._font(9), command=lambda value=favorite: self._edit_favorite(value)).grid(row=3, column=2, padx=4, pady=(0, 10), sticky="ew")
             ctk.CTkButton(card, text="삭제", width=48, height=29, corner_radius=9, fg_color="#342133", hover_color="#49283C", text_color="#FFB3C0", font=self._font(9), command=lambda value=favorite: self._delete_favorite(value)).grid(row=3, column=3, padx=(4, 10), pady=(0, 10))
 
     def _apply_favorite(self, favorite: FavoritePreset) -> None:
@@ -2244,6 +2264,7 @@ class DownloaderApp(ctk.CTk):
                 self.entry_vars[label].set(value)
             self.separate_folders_var.set(favorite.separate_character_folders)
             self.defender_scan_var.set(favorite.scan_with_defender)
+            self.fixed_destination_var.set(favorite.fixed_destination)
             self.folder_var.set(favorite.destination or "")
         finally:
             self.preview_updates_suspended = False
@@ -2262,14 +2283,21 @@ class DownloaderApp(ctk.CTk):
         except (ValidationError, ValueError) as error:
             self._show_input_error("즐겨찾기 저장", error)
             return
-        dialog = ctk.CTkInputDialog(text="즐겨찾기 이름을 입력하세요.", title="즐겨찾기 저장")
-        if not (name := (dialog.get_input() or "").strip()):
-            return
-        fixed_destination = messagebox.askyesno(
-            "저장 위치 고정",
-            "현재 저장 위치를 이 즐겨찾기에 고정할까요?\n\n아니요를 선택하면 바로 다운로드할 때마다 폴더를 묻습니다.",
-            parent=self,
+        editing = next(
+            (item for item in self.favorites if item.name == self.editing_favorite_name),
+            None,
         )
+        if self.editing_favorite_name is not None and editing is None:
+            self._write_log("수정 중인 즐겨찾기를 찾을 수 없습니다. 목록을 새로 불러와 다시 시도하세요.")
+            self._cancel_favorite_edit(announce=False)
+            return
+        if editing:
+            name = editing.name
+        else:
+            dialog = ctk.CTkInputDialog(text="즐겨찾기 이름을 입력하세요.", title="즐겨찾기 저장")
+            if not (name := (dialog.get_input() or "").strip()):
+                return
+        fixed_destination = self.fixed_destination_var.get()
         destination = self.folder_var.get().strip() or None
         if fixed_destination and not destination:
             destination = filedialog.askdirectory(initialdir=str(Path.cwd()), parent=self) or None
@@ -2294,8 +2322,8 @@ class DownloaderApp(ctk.CTk):
         except (ValidationError, ValueError) as error:
             self._show_input_error("즐겨찾기 저장", error)
             return
-        existing = next((item for item in self.favorites if item.name.casefold() == preset.name.casefold()), None)
-        if existing and not messagebox.askyesno("즐겨찾기 갱신", f"'{existing.name}' 설정을 덮어쓸까요?", parent=self):
+        existing = editing or next((item for item in self.favorites if item.name.casefold() == preset.name.casefold()), None)
+        if existing and not editing and not messagebox.askyesno("즐겨찾기 갱신", f"'{existing.name}' 설정을 덮어쓸까요?", parent=self):
             return
         if existing:
             self.favorites[self.favorites.index(existing)] = preset
@@ -2309,13 +2337,18 @@ class DownloaderApp(ctk.CTk):
         except OSError as error:
             self._write_log(f"즐겨찾기 파일 저장 실패: {error}")
             return
+        was_editing = editing is not None
+        self._cancel_favorite_edit(announce=False)
         self._render_favorites()
-        self._write_log(f"즐겨찾기 저장 완료: {preset.name}")
+        action = "수정" if was_editing else "저장"
+        self._clear_live_preview(f"즐겨찾기 {action} 완료 · {preset.name}")
+        self._write_log(f"즐겨찾기 {action} 완료: {preset.name}")
 
     def _preview_favorite(self, favorite: FavoritePreset) -> None:
         if self.running:
             self._write_log("다운로드 중에는 즐겨찾기 미리보기를 열 수 없습니다.")
             return
+        self._cancel_favorite_edit(announce=False)
         self._apply_favorite(favorite)
         self._manual_preview()
 
@@ -2324,6 +2357,7 @@ class DownloaderApp(ctk.CTk):
         if self.running:
             self._write_log("이미 다운로드가 진행 중입니다.")
             return
+        self._cancel_favorite_edit(announce=False)
         self._apply_favorite(favorite)
         if favorite.fixed_destination and favorite.destination:
             self.folder_var.set(favorite.destination)
@@ -2344,6 +2378,8 @@ class DownloaderApp(ctk.CTk):
         if not messagebox.askyesno("즐겨찾기 삭제", f"'{favorite.name}' 항목을 삭제할까요?", parent=self):
             return
         self.favorites = [item for item in self.favorites if item is not favorite]
+        if self.editing_favorite_name == favorite.name:
+            self._cancel_favorite_edit(announce=False)
         try:
             save_favorites(self.favorites)
         except OSError as error:
