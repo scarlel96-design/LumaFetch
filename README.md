@@ -5,18 +5,14 @@ Luma Fetch is a Windows desktop batch downloader for image URLs that follow a pr
 ## Features
 
 - Async downloads using `aiohttp` and `aiofiles`
-- Multiple character codes and numeric situation ranges
+- Multiple character codes and mixed situation expressions such as `01..50,s01..83`
 - Korean template aliases such as `캐릭터`, `상황`, and `의상`
-- Manual character gallery with first-image covers and an uncapped, Canvas-native virtualized thumbnail grid
-- Original-image viewer with fit/fill/100% modes, wheel zoom, drag panning, fullscreen, and Left/Right navigation
-- Split network/decode pipeline, bounded queues, frame-sliced rendering, disk-backed preview cache, and automatic cache cleanup
-- Named favorites that restore every input and support preview or direct download with optional fixed destinations
-- Optional Referer header support for hosts that restrict cross-site images
-- GitHub Releases updates with in-app download, SHA-256 verification, silent installation, and automatic restart
-- Installer prerequisite detection with opt-in Microsoft VC++ Runtime installation from a pinned official HTTPS package
-- Optional character subfolders, retry handling, cancellation, progress, and error summaries
-- HTTPS/public-network/image-type validation and bounded download size
-- Optional Microsoft Defender scan request
+- Manual character gallery with first-image covers and a Canvas-native virtualized thumbnail grid
+- Original-image viewer with fit/fill/100% modes, wheel zoom, drag panning, fullscreen, and navigation
+- Split network/decode pipeline, non-blocking UI event bus, disk-backed preview cache, and lifecycle-safe cleanup
+- Named favorites that restore every input; damaged entries are skipped individually without hiding valid favorites
+- Optional Referer handling, character subfolders, retries, cancellation, Microsoft Defender scanning, and update verification
+- Automatic cleanup of stale `.part` files after interrupted downloads
 
 ## Run from source
 
@@ -29,37 +25,53 @@ pip install -r requirements.txt
 python app.py
 ```
 
-## Template examples
-
-Use either token style below. Values entered in character code keep their original letter case.
+## Template and range examples
 
 ```text
 https://example.org/images/{char}/{situation}.webp
 https://example.org/images/캐릭터/상황.webp
 ```
 
-Situation ranges accept comma-separated values such as `0001..0500, 1001..1420`.
+Situation values are comma-separated and may mix literals, numeric ranges, and prefixed ranges:
 
-## Build a Windows installer
-
-Install PyInstaller and Inno Setup 6, then run from PowerShell:
-
-```powershell
-pip install pyinstaller
-pyinstaller --noconfirm --clean --distpath work\dist --workpath work\pyinstaller-build313 LumaFetch.spec
-ISCC installer\LumaFetch.iss
+```text
+01..50,s01..83
+s01..s83,bonus
+0001..0500,1001..1420
 ```
 
-The generated installer is placed in `outputs/` by the Inno Setup script. Build artifacts are deliberately not committed.
+## Test
+
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+## Build the Windows installer
+
+On Windows x64 with Python 3.12 or later, run the root build command:
+
+```powershell
+.\BUILD_RELEASE.cmd
+```
+
+The command creates an isolated build environment, installs required build packages, runs tests, builds the application with PyInstaller, compiles the Inno Setup installer, and writes SHA-256/build metadata. The repository's `installer/LumaFetch.ico` must be present.
+
+Generated files:
+
+```text
+outputs\LumaFetch-Setup-1.13.0.exe
+outputs\SHA256SUMS.txt
+outputs\BUILD_INFO.txt
+```
+
+The GitHub Actions workflow performs the same Windows build and uploads the installer as an artifact. Build artifacts are deliberately not committed.
 
 ## Security and distribution
 
-- The app accepts only public HTTPS image URLs with approved image extensions.
-- It checks response MIME type, basic image signatures, and a 30 MiB maximum file size.
-- The updater accepts only the versioned installer asset from this repository's GitHub Release, requires GitHub's SHA-256 asset digest, verifies size and hash, and only then starts the installer.
-- Updates are handed to Inno Setup with no separate wizard, then Luma Fetch is relaunched with an update-complete marker.
-- Missing prerequisites are detected before installation. The VC++ package uses a versioned Microsoft HTTPS URL and a pinned SHA-256 hash; a mismatch aborts installation.
-- Release binaries should be published with a SHA-256 hash. A third-party detection result is not, by itself, a proof that a file is safe or malicious.
+- Only public HTTPS image URLs with approved image extensions are accepted.
+- MIME type, image signature, and a 30 MiB image limit are enforced.
+- The updater accepts only the versioned installer from this repository, verifies GitHub's SHA-256 digest and size, and then launches Inno Setup.
 - Do not use the app to download content without permission from its owner or host.
 
 ## License

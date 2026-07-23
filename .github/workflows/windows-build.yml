@@ -1,0 +1,58 @@
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/lumafetch-1.13.0
+  pull_request:
+    paths:
+      - "**/*.py"
+      - "requirements*.txt"
+      - "LumaFetch.spec"
+      - "BUILD_RELEASE.cmd"
+      - "installer/**"
+      - "scripts/build_windows.ps1"
+      - ".github/workflows/windows-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build release installer
+        shell: cmd
+        run: BUILD_RELEASE.cmd
+
+      - name: Verify release outputs
+        shell: pwsh
+        run: |
+          $path = "outputs\LumaFetch-Setup-1.13.0.exe"
+          if (-not (Test-Path $path)) { throw "Missing installer: $path" }
+          if ((Get-Item $path).Length -lt 1MB) { throw "Installer is unexpectedly small" }
+          Get-Content "outputs\BUILD_INFO.txt"
+          Get-Content "outputs\SHA256SUMS.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LumaFetch-Setup-1.13.0
+          path: |
+            outputs/LumaFetch-Setup-1.13.0.exe
+            outputs/SHA256SUMS.txt
+            outputs/BUILD_INFO.txt
+          if-no-files-found: error
+          retention-days: 14

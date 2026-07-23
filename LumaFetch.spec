@@ -2,9 +2,9 @@
 
 from pathlib import Path
 
-
 project_root = Path(SPECPATH)
 icon_path = project_root / "installer" / "LumaFetch.ico"
+version_path = project_root / "installer" / "version_info.txt"
 
 a = Analysis(
     [str(project_root / "app.py")],
@@ -15,9 +15,9 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=["pytest"],
     noarchive=False,
-    optimize=0,
+    optimize=1,
 )
 pyz = PYZ(a.pure)
 
@@ -34,6 +34,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     icon=[str(icon_path)],
+    version=str(version_path),
 )
 
 coll = COLLECT(

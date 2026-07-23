@@ -1,0 +1,106 @@
+{
+  ".github/workflows/windows-build.yml": {
+    "size": 1469,
+    "sha256": "f054a54941b2f82dd256d363df2834cbe8b3470eee0b1bdb6a6ba5f63c112fb5"
+  },
+  ".gitignore": {
+    "size": 155,
+    "sha256": "5feb2f85c98e19e263251065487e0a787886452e4f406ff4ff45eafee57a18da"
+  },
+  "APPLY_TO_REPOSITORY.md": {
+    "size": 1094,
+    "sha256": "1e703d73e8e0a104bc1fee2ce5f379a740dfe61f5a57defa8d8a4f7cadfc536a"
+  },
+  "BUILD_RELEASE.cmd": {
+    "size": 674,
+    "sha256": "2105af42c79302553b9c7afeb8182215e411105c524feb74a3d15885aaf5d349"
+  },
+  "CHANGELOG.md": {
+    "size": 2375,
+    "sha256": "a39013f5b25d83337013aac469366fe21f2f9368335b0d2c304f43e0ff24692a"
+  },
+  "GROK_BUILD_ONLY.md": {
+    "size": 1871,
+    "sha256": "e79859a803a716e4f86b68e868d3df01ad5bc6ffb20bf3c10bb3bd2ea41dbf32"
+  },
+  "GROK_BUILD_PROMPT.txt": {
+    "size": 1522,
+    "sha256": "55053a0630828c1feb0598cac99102e9d2c02bc2ec6bc297ffa2798ab5bf1376"
+  },
+  "IMPLEMENTATION_REPORT.md": {
+    "size": 3010,
+    "sha256": "c3640448ddf13796c181bb2e7380a03590a1a23b738fd086f273545ee3e3301e"
+  },
+  "LumaFetch.spec": {
+    "size": 940,
+    "sha256": "5b457876abe8b58635dfd7a3313c00dae01f28711450ef3d7b957a15c35c8abc"
+  },
+  "README.md": {
+    "size": 2865,
+    "sha256": "fb7c986e423d3e22c1c55e207d753e0b59dfb1c8804ede676a6fdb1f18416289"
+  },
+  "app.py": {
+    "size": 135655,
+    "sha256": "55897b6a05bcc593c1eab484a1ab331dac226c06c9c142dc85b5ade49c50c61d"
+  },
+  "installer/LumaFetch.iss": {
+    "size": 5718,
+    "sha256": "da046436e0b364c2c460a3e4cf6f1194fa7f0fdc8a094c95a129510bee5b0b9f"
+  },
+  "installer/version_info.txt": {
+    "size": 779,
+    "sha256": "3be4c8dba2bbd9c0f317d0772950258667442f797098414f348da9b39c315d93"
+  },
+  "lumafetch/__init__.py": {
+    "size": 85,
+    "sha256": "1ab243997652d0fa15eda9849f6dcc8d064fa5e65b0fb5cf729132e7ebb7b32e"
+  },
+  "lumafetch/ranges.py": {
+    "size": 2279,
+    "sha256": "1e1621914da1e8aac9af6fc92f61113bf736dd2020a7b0f9078137ef94d48936"
+  },
+  "lumafetch/runtime.py": {
+    "size": 7474,
+    "sha256": "59b924f420896a4b69ed135bf32e70cd2fe2980748782a1a02477e54a7fcb34d"
+  },
+  "lumafetch/storage.py": {
+    "size": 3236,
+    "sha256": "d33cbc7ff9e1fa5b92d7eac38e5a8c773ebd40251487a69c4cdacfef2db436f5"
+  },
+  "pytest.ini": {
+    "size": 66,
+    "sha256": "64adb7d108928854ea3d4ea47b53c4ed95c8ff4a38bff8a10f5a80f47b1dea28"
+  },
+  "requirements-dev.txt": {
+    "size": 76,
+    "sha256": "24a0bb554c5255698fd33238a83fca6e2226475c8c8e65f86c465fc6307da083"
+  },
+  "requirements.txt": {
+    "size": 98,
+    "sha256": "e9374a960949a0a9a15ba82a2dae60d2c4571069a80b2168a9d97fdc2c8a2dd7"
+  },
+  "scripts/build_windows.ps1": {
+    "size": 8729,
+    "sha256": "2587023fb3ba1b84499d5a5b42849b7889d15b9955474a8e9618e027774f81b6"
+  },
+  "tests/test_app_models.py": {
+    "size": 1535,
+    "sha256": "7c44a5553bbf7664a14dbf35de87ecef1477458d225c1a64c1611aed2ce51e3c"
+  },
+  "tests/test_ranges.py": {
+    "size": 1195,
+    "sha256": "569a3dec42410e911fa7e0ae7fe367c591bd3da2d98ac2bcace450b3ac4044fc"
+  },
+  "tests/test_release_contract.py": {
+    "size": 735,
+    "sha256": "0a7e3451c273edc6cf341b76364d088702b93d69caa08f8d9f4841999af9541e"
+  },
+  "tests/test_runtime.py": {
+    "size": 2286,
+    "sha256": "b2d799495ba65f799145dd74afaeb8cfc4ecd652f0231a8fa7b5ffdf6b4b482c"
+  },
+  "tests/test_storage.py": {
+    "size": 2097,
+    "sha256": "ca705e9d072c9422ef9e04b7772cb9996d6f30ea599288811a23c3bdbf2d4af6"
+  }
+}

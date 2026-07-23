@@ -1,5 +1,5 @@
 #define MyAppName "Luma Fetch"
-#define MyAppVersion "1.12.9"
+#define MyAppVersion "1.13.0"
 #define MyAppPublisher "Luma Fetch"
 #define MyAppExeName "LumaFetch.exe"
 #define VCRedistURL "https://download.visualstudio.microsoft.com/download/pr/ebdab8e5-1d7b-4d9f-a11b-cbb1720c3b12/843068991DAAA1F73AD9F6239BCE4D0F6A07A51F18C37EA2A867E9BECA71295C/VC_redist.x64.exe"
@@ -11,14 +11,14 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 SetupIconFile=LumaFetch.ico
-VersionInfoVersion=1.12.9.0
-VersionInfoProductVersion=1.12.9.0
+VersionInfoVersion=1.13.0.0
+VersionInfoProductVersion=1.13.0.0
 DefaultDirName={localappdata}\Programs\LumaFetch
 UsePreviousAppDir=no
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\outputs
-OutputBaseFilename=LumaFetch-Setup-1.12.9
+OutputBaseFilename=LumaFetch-Setup-1.13.0
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

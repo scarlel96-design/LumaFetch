@@ -8,9 +8,7 @@ import hmac
 import ipaddress
 import json
 import os
-import queue
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,13 +27,16 @@ from aiohttp.abc import AbstractResolver
 from aiohttp.resolver import DefaultResolver
 import customtkinter as ctk
 import tkinter as tk
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
 
+from lumafetch.ranges import expand_code_expression
+from lumafetch.runtime import PreviewCacheManager, UiEventBus, WorkerRegistry
+from lumafetch.storage import atomic_write_json, cleanup_stale_part_files, load_validated_json_list
 
-RANGE_PATTERN = re.compile(r"^\s*(\d+)\s*\.\.\s*(\d+)\s*$")
-APP_VERSION = "1.12.9"
+
+APP_VERSION = "1.13.0"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -257,30 +258,24 @@ class DownloadConfig(BaseModel):
         if not raw_codes:
             raise ValueError("캐릭터 코드를 하나 이상 입력하세요.")
 
-        values: dict[str, None] = {}
-        for code in raw_codes:
-            if match := re.fullmatch(r"(.+?)(\d+)\s*\.\.\s*(\d+)", code):
-                prefix, start_text, end_text = match.groups()
-                start, end = int(start_text), int(end_text)
-                if start > end:
-                    raise ValueError(f"잘못된 캐릭터 범위: {code}")
-                if end - start + 1 > MAX_CHARACTER_CODES:
-                    raise ValueError(f"한 캐릭터 범위는 최대 {MAX_CHARACTER_CODES:,}개까지 가능합니다.")
-                width = max(len(start_text), len(end_text)) if start_text.startswith("0") or end_text.startswith("0") else 0
-                for number in range(start, end + 1):
-                    values.setdefault(f"{prefix}{number:0{width}d}", None)
-            else:
-                values.setdefault(code, None)
+        def validate_character_code(code: str) -> str:
+            if len(code) > MAX_CHARACTER_CODE_LENGTH:
+                raise ValueError(f"각 캐릭터 코드는 최대 {MAX_CHARACTER_CODE_LENGTH}자까지 입력할 수 있습니다.")
+            if code in {".", ".."}:
+                raise ValueError("캐릭터 코드로 . 또는 ..은 사용할 수 없습니다.")
+            if any(char in code for char in r'\/:*?"<>|'):
+                raise ValueError("캐릭터 코드에는 파일명에 사용할 수 없는 문자를 쓸 수 없습니다.")
+            return code
 
-        codes = list(values)
+        codes = expand_code_expression(
+            ",".join(raw_codes),
+            validate=validate_character_code,
+            max_range_items=MAX_CHARACTER_CODES,
+            max_total_items=MAX_CHARACTER_CODES,
+            item_label="캐릭터 코드",
+        )
         if len(codes) > MAX_CHARACTER_CODES:
             raise ValueError(f"캐릭터 코드는 최대 {MAX_CHARACTER_CODES:,}개까지 입력할 수 있습니다.")
-        if any(len(code) > MAX_CHARACTER_CODE_LENGTH for code in codes):
-            raise ValueError(f"각 캐릭터 코드는 최대 {MAX_CHARACTER_CODE_LENGTH}자까지 입력할 수 있습니다.")
-        if any(code in {".", ".."} for code in codes):
-            raise ValueError("캐릭터 코드로 . 또는 ..은 사용할 수 없습니다.")
-        if any(any(char in code for char in r'\/:*?"<>|') for code in codes):
-            raise ValueError("캐릭터 코드에는 파일명에 사용할 수 없는 문자를 쓸 수 없습니다.")
         return ",".join(codes)
     @field_validator("outfit")
     @classmethod
@@ -300,25 +295,21 @@ class DownloadConfig(BaseModel):
 
     def expand_characters(self) -> list[str]:
         return self.character.split(",")
+    @staticmethod
+    def validate_situation_code(code: str) -> str:
+        if not code or code in {".", ".."}:
+            raise ValueError("상황 코드를 입력하세요.")
+        if any(ord(char) < 32 for char in code) or any(char in code for char in r'\/:*?"<>|'):
+            raise ValueError("상황 코드에는 파일명에 사용할 수 없는 문자를 쓸 수 없습니다.")
+        return code
+
     def expand_situations(self) -> list[str]:
-        values: dict[str, None] = {}
-        for part in self.ranges.split(","):
-            code = part.strip()
-            if code.isdecimal():
-                values.setdefault(code, None)
-                continue
-            if not (match := RANGE_PATTERN.fullmatch(part)):
-                raise ValueError("상황 코드는 1 또는 0001..0500처럼 쉼표로 구분하세요.")
-            start_text, end_text = match.groups()
-            start, end = int(start_text), int(end_text)
-            if start > end:
-                raise ValueError(f"잘못된 범위: {code}")
-            width = max(len(start_text), len(end_text)) if start_text.startswith("0") or end_text.startswith("0") else 0
-            if end - start > 100_000:
-                raise ValueError("한 범위는 최대 100,001개까지 가능합니다.")
-            for number in range(start, end + 1):
-                values.setdefault(f"{number:0{width}d}", None)
-        return list(values)
+        return expand_code_expression(
+            self.ranges,
+            validate=self.validate_situation_code,
+            max_range_items=100_001,
+            item_label="상황 코드",
+        )
 
 
 class FavoritePreset(BaseModel):
@@ -361,26 +352,23 @@ class FavoritePreset(BaseModel):
         return self
 
 
-def load_favorites(path: Path = FAVORITES_FILE) -> list[FavoritePreset]:
-    """Load a bounded local preset file; malformed data never blocks startup."""
-    try:
-        if not path.is_file() or path.stat().st_size > 512 * 1024:
-            return []
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, list):
-            return []
-        return [FavoritePreset.model_validate(item) for item in payload[:MAX_FAVORITES]]
-    except (OSError, ValueError, ValidationError, json.JSONDecodeError):
-        return []
+def load_favorites(path: Path = FAVORITES_FILE) -> tuple[list[FavoritePreset], int, str | None]:
+    """Load each preset independently so one corrupted item cannot hide valid favorites."""
+    result = load_validated_json_list(
+        path,
+        validator=FavoritePreset.model_validate,
+        max_items=MAX_FAVORITES,
+        max_bytes=512 * 1024,
+    )
+    return result.items, result.rejected, result.file_error
 
 
 def save_favorites(favorites: list[FavoritePreset], path: Path = FAVORITES_FILE) -> None:
     """Atomically save validated presets in the current user's app-data folder."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    payload = [favorite.model_dump(mode="json") for favorite in favorites[:MAX_FAVORITES]]
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    atomic_write_json(
+        path,
+        (favorite.model_dump(mode="json") for favorite in favorites[:MAX_FAVORITES]),
+    )
 
 @dataclass(slots=True)
 class DownloadStats:
@@ -719,8 +707,14 @@ async def fetch_live_previews(
                     errors.append(error)
 
     async def write_cache(path: Path, data: bytes) -> None:
-        async with aiofiles.open(path, "wb") as file:
-            await file.write(data)
+        temporary = path.with_suffix(path.suffix + ".part")
+        try:
+            async with aiofiles.open(temporary, "wb") as file:
+                await file.write(data)
+                await file.flush()
+            await asyncio.to_thread(os.replace, temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     async def decode_worker() -> None:
         nonlocal success, failed
@@ -754,7 +748,7 @@ async def fetch_live_previews(
                     )
                 success += 1
                 on_item(index, ready)
-            except (OSError, ValueError, UnidentifiedImageError) as error:
+            except Exception as error:
                 failed += 1
                 message = reason(error)
                 if message not in errors and len(errors) < 3:
@@ -821,7 +815,9 @@ class Downloader:
                 f"403 자동 대응 · {host} 요청에 Referer {referer} 적용",
             ),
         )
-        self.stats = DownloadStats(total=len(config.expand_characters()) * len(config.expand_situations()))
+        self.characters = config.expand_characters()
+        self.situations = config.expand_situations()
+        self.stats = DownloadStats(total=len(self.characters) * len(self.situations))
         self.defender = SecurityGuard.defender_executable() if config.scan_with_defender else None
 
     def scan_with_defender(self, path: Path) -> bool:
@@ -843,11 +839,20 @@ class Downloader:
 
     @staticmethod
     def situation_candidates(situation: str) -> list[str]:
-        """Try the entered form first, then its unpadded numeric equivalent."""
-        unpadded = str(int(situation))
+        """Try the entered form first, then an unpadded numeric-suffix equivalent."""
+        if not (match := re.fullmatch(r"(.*?)(\d+)", situation)):
+            return [situation]
+        prefix, number_text = match.groups()
+        unpadded = f"{prefix}{int(number_text)}"
         return [situation] if unpadded == situation else [situation, unpadded]
 
-    async def download_one(self, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, character: str, situation: str) -> Literal["success", "failed", "cancelled"]:
+    async def download_one(
+        self,
+        session: aiohttp.ClientSession,
+        semaphore: asyncio.Semaphore,
+        character: str,
+        situation: str,
+    ) -> Literal["success", "failed", "cancelled"]:
         if self.cancelled.is_set():
             return "cancelled"
         extension = Path(urlparse(self.make_url(character, situation)).path).suffix or ".webp"
@@ -855,59 +860,73 @@ class Downloader:
         output_dir.mkdir(parents=True, exist_ok=True)
         output = output_dir / f"{character}_{situation}{self.config.outfit}{extension}"
         temp = output.with_name(f".{output.stem}.part{output.suffix}")
+        temp.unlink(missing_ok=True)
         last_error: Exception | None = None
-        async with semaphore:
-            for candidate in self.situation_candidates(situation):
-                url = self.make_url(character, candidate)
-                for attempt in range(1, self.config.retries + 1):
-                    if self.cancelled.is_set():
-                        return "cancelled"
-                    try:
-                        response = await self.request_policy.get(session, url, allow_redirects=False)
-                        async with response:
-                            if response.status == 404:
-                                last_error = aiohttp.ClientResponseError(
-                                    response.request_info, response.history, status=response.status
-                                )
-                                break
-                            if response.status != 200:
-                                raise aiohttp.ClientResponseError(
-                                    response.request_info, response.history, status=response.status
-                                )
-                            if not response.content_type.startswith("image/"):
-                                raise ValueError("이미지 MIME 형식이 아닙니다.")
-                            if response.content_length and response.content_length > MAX_IMAGE_BYTES:
-                                raise ValueError("이미지 크기 제한(30 MiB)을 초과했습니다.")
-                            header = bytearray()
-                            downloaded = 0
-                            async with aiofiles.open(temp, "wb") as file:
-                                async for chunk in response.content.iter_chunked(256 * 1024):
-                                    if self.cancelled.is_set():
-                                        return "cancelled"
-                                    downloaded += len(chunk)
-                                    if downloaded > MAX_IMAGE_BYTES:
-                                        raise ValueError("이미지 크기 제한(30 MiB)을 초과했습니다.")
-                                    if len(header) < 32:
-                                        header.extend(chunk[:32 - len(header)])
-                                    await file.write(chunk)
-                            if not SecurityGuard.has_safe_image_signature(bytes(header)):
-                                raise ValueError("허용된 래스터 이미지 서명이 아닙니다.")
-                            if self.config.scan_with_defender:
-                                scanned = await asyncio.to_thread(self.scan_with_defender, temp)
-                                if not scanned and not getattr(self, "defender_skip_notified", False):
-                                    self.notify("log", "Defender 검사가 건너뛰어졌거나 완료되지 않았습니다. 이미지 서명 검증은 계속 적용됩니다.")
-                                    self.defender_skip_notified = True
-                        temp.replace(output)
-                        return "success"
-                    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as error:
-                        last_error = error
-                        temp.unlink(missing_ok=True)
-                        if attempt < self.config.retries:
-                            await asyncio.sleep(0.35 * attempt)
-        self.notify("log", f"실패 [{character}/{situation}]: {last_error}")
-        return "failed"
+        committed = False
+        try:
+            async with semaphore:
+                for candidate in self.situation_candidates(situation):
+                    url = self.make_url(character, candidate)
+                    for attempt in range(1, self.config.retries + 1):
+                        if self.cancelled.is_set():
+                            return "cancelled"
+                        try:
+                            response = await self.request_policy.get(session, url, allow_redirects=False)
+                            async with response:
+                                if response.status == 404:
+                                    last_error = aiohttp.ClientResponseError(
+                                        response.request_info, response.history, status=response.status
+                                    )
+                                    break
+                                if response.status != 200:
+                                    raise aiohttp.ClientResponseError(
+                                        response.request_info, response.history, status=response.status
+                                    )
+                                if not response.content_type.startswith("image/"):
+                                    raise ValueError("이미지 MIME 형식이 아닙니다.")
+                                if response.content_length and response.content_length > MAX_IMAGE_BYTES:
+                                    raise ValueError("이미지 크기 제한(30 MiB)을 초과했습니다.")
+                                header = bytearray()
+                                downloaded = 0
+                                async with aiofiles.open(temp, "wb") as file:
+                                    async for chunk in response.content.iter_chunked(256 * 1024):
+                                        if self.cancelled.is_set():
+                                            return "cancelled"
+                                        downloaded += len(chunk)
+                                        if downloaded > MAX_IMAGE_BYTES:
+                                            raise ValueError("이미지 크기 제한(30 MiB)을 초과했습니다.")
+                                        if len(header) < 32:
+                                            header.extend(chunk[:32 - len(header)])
+                                        await file.write(chunk)
+                                    await file.flush()
+                                if not SecurityGuard.has_safe_image_signature(bytes(header)):
+                                    raise ValueError("허용된 래스터 이미지 서명이 아닙니다.")
+                                if self.config.scan_with_defender:
+                                    scanned = await asyncio.to_thread(self.scan_with_defender, temp)
+                                    if not scanned and not getattr(self, "defender_skip_notified", False):
+                                        self.notify("log", "Defender 검사가 건너뛰어졌거나 완료되지 않았습니다. 이미지 서명 검증은 계속 적용됩니다.")
+                                        self.defender_skip_notified = True
+                            await asyncio.to_thread(os.replace, temp, output)
+                            committed = True
+                            return "success"
+                        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as error:
+                            last_error = error
+                            temp.unlink(missing_ok=True)
+                            if attempt < self.config.retries and not self.cancelled.is_set():
+                                await asyncio.sleep(0.35 * attempt)
+            if self.cancelled.is_set():
+                return "cancelled"
+            self.notify("log", f"실패 [{character}/{situation}]: {last_error}")
+            return "failed"
+        finally:
+            if not committed:
+                temp.unlink(missing_ok=True)
+
     async def run(self) -> DownloadStats:
         self.config.destination.mkdir(parents=True, exist_ok=True)
+        removed_parts = await asyncio.to_thread(cleanup_stale_part_files, self.config.destination)
+        if removed_parts:
+            self.notify("log", f"이전 작업의 .part 임시 파일 {removed_parts}개를 정리했습니다.")
         if self.config.scan_with_defender and not self.defender:
             raise RuntimeError("Microsoft Defender 검사 도구를 찾을 수 없습니다.")
         connector = aiohttp.TCPConnector(
@@ -917,19 +936,19 @@ class Downloader:
         timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=45)
         headers = make_request_headers(None)
         progress = Progress(SpinnerColumn(), TextColumn("다운로드"), BarColumn(), "{task.completed}/{task.total}", TimeRemainingColumn())
-        worker_count = self.config.concurrency
+        worker_count = min(self.config.concurrency, max(1, self.stats.total))
         work_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue(maxsize=worker_count * 2)
 
         async def produce() -> None:
-            for character in self.config.expand_characters():
-                for situation in self.config.expand_situations():
-                    if self.cancelled.is_set():
-                        break
-                    await work_queue.put((character, situation))
-                if self.cancelled.is_set():
-                    break
-            for _ in range(worker_count):
-                await work_queue.put(None)
+            try:
+                for character in self.characters:
+                    for situation in self.situations:
+                        if self.cancelled.is_set():
+                            return
+                        await work_queue.put((character, situation))
+            finally:
+                for _ in range(worker_count):
+                    await work_queue.put(None)
 
         async def consume(
             session: aiohttp.ClientSession,
@@ -937,15 +956,21 @@ class Downloader:
             task_id: object,
             progress_view: Progress,
         ) -> None:
-            while (work := await work_queue.get()) is not None:
-                character, situation = work
-                result = await self.download_one(session, semaphore, character, situation)
-                match result:
-                    case "success": self.stats.success += 1
-                    case "failed": self.stats.failed += 1
-                    case _: self.stats.cancelled += 1
-                progress_view.advance(task_id)
-                self.notify("progress", self.stats)
+            while True:
+                work = await work_queue.get()
+                try:
+                    if work is None:
+                        return
+                    character, situation = work
+                    result = await self.download_one(session, semaphore, character, situation)
+                    match result:
+                        case "success": self.stats.success += 1
+                        case "failed": self.stats.failed += 1
+                        case _: self.stats.cancelled += 1
+                    progress_view.advance(task_id)
+                    self.notify("progress", self.stats)
+                finally:
+                    work_queue.task_done()
 
         with progress:
             task_id = progress.add_task("images", total=self.stats.total)
@@ -1163,6 +1188,16 @@ class VirtualPreviewGrid(ctk.CTkFrame):
                 self._schedule_redraw()
                 break
 
+    def destroy(self) -> None:
+        if self.redraw_id is not None:
+            try:
+                self.after_cancel(self.redraw_id)
+            except tk.TclError:
+                pass
+            self.redraw_id = None
+        self.clear()
+        super().destroy()
+
 class DownloaderApp(ctk.CTk):
     """Desktop-first UI: macOS softness, One UI spacing, Windows 11 clarity."""
 
@@ -1182,7 +1217,9 @@ class DownloaderApp(ctk.CTk):
         self.geometry("1080x700")
         self.minsize(900, 620)
         self.configure(fg_color=self.COLORS["bg"])
-        self.events: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=512)
+        self._closing = False
+        self.events = UiEventBus(maxsize=2048)
+        self.workers = WorkerRegistry()
         self.cancel_event = threading.Event()
         self.running = False
         self.entries: dict[str, ctk.CTkEntry] = {}
@@ -1195,18 +1232,45 @@ class DownloaderApp(ctk.CTk):
         self.preview_cancel_event = threading.Event()
         self.preview_config: DownloadConfig | None = None
         self.preview_cache_root = Path(tempfile.mkdtemp(prefix="LumaFetch-preview-"))
+        self.preview_cache = PreviewCacheManager(self.preview_cache_root)
+        self.gallery_cache_dir: Path | None = None
         self.gallery_items: dict[int, PreviewImage] = {}
         self.viewer_sequence = 0
         self.viewer_photo: tk.PhotoImage | None = None
+        self.viewer_protected_cache: Path | None = None
         self.update_checking = False
-        self.favorites = load_favorites()
+        self.favorites, self.favorite_rejected_count, self.favorite_load_error = load_favorites()
         self.editing_favorite_name: str | None = None
         self._build()
+        if self.favorite_rejected_count:
+            self._write_log(
+                f"손상된 즐겨찾기 {self.favorite_rejected_count}개를 건너뛰고 "
+                f"정상 항목 {len(self.favorites)}개를 복구했습니다."
+            )
+        if self.favorite_load_error:
+            self._write_log(f"즐겨찾기 파일 읽기 경고: {self.favorite_load_error}")
         if "--update-complete" in sys.argv:
             self.update_status.configure(text=f"v{APP_VERSION} 업데이트 완료", text_color=self.COLORS["success"])
             self.after(250, lambda: self._write_log(f"업데이트 완료 — Luma Fetch v{APP_VERSION}"))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(12 if not self.events.empty() else 30, self._poll_events)
+        self.poll_after_id: str | None = self.after(30, self._poll_events)
+
+    def _start_worker(
+        self,
+        target: Callable[..., object],
+        *,
+        args: tuple[object, ...] = (),
+        name: str,
+    ) -> threading.Thread | None:
+        return self.workers.start(target, args=args, name=name)
+
+    def _cleanup_ready_preview_caches(self, paths: list[Path]) -> None:
+        for path in paths:
+            self._start_worker(
+                self.preview_cache.remove,
+                args=(path,),
+                name=f"preview-cache-cleanup-{path.name}",
+            )
 
     def _font(self, size: int, weight: str = "normal") -> ctk.CTkFont:
         return ctk.CTkFont(family="Segoe UI Variable", size=size, weight=weight)
@@ -1280,7 +1344,7 @@ class DownloaderApp(ctk.CTk):
         self._entry(form, "템플릿 URL", "치환 토큰: 캐릭터 · 상황 · 의상", 0, 0, span=2)
         self._entry(form, "캐릭터 코드", "쉼표로 구분 · A1..7 가능", 1, 0)
         self._entry(form, "의상 코드", "공란 = X", 1, 1)
-        self._entry(form, "상황 코드 범위", "1, 2..70 또는 0001..0500", 2, 0)
+        self._entry(form, "상황 코드 범위", "1, 01..50 또는 s01..83", 2, 0)
         self._entry(form, "동시 다운로드", "공란 = 20", 2, 1)
         self._entry(form, "Referer", "필요 시 원본 페이지 주소", 3, 0, span=2)
         preview_row = ctk.CTkFrame(form, fg_color="transparent")
@@ -1301,7 +1365,7 @@ class DownloaderApp(ctk.CTk):
         )
         self.preview.grid(row=0, column=0, sticky="ew")
         input_help = (
-            "캐릭터 코드는 A1..7 또는 쉼표(,)로 구분하고, 상황 코드는 1 또는 1..10 형식으로 입력하세요.\n"
+            "캐릭터 코드는 A1..7 또는 쉼표(,)로 구분하고, 상황 코드는 1, 01..50, s01..83 형식으로 입력하세요.\n"
             "템플릿 URL에서 코드가 들어갈 위치는 캐릭터 · 의상 · 상황 키워드로 채우세요."
         )
         ctk.CTkLabel(
@@ -1442,7 +1506,7 @@ class DownloaderApp(ctk.CTk):
         self.update_checking = True
         self.update_button.configure(state="disabled", text="확인 중…")
         self.update_status.configure(text="GitHub 릴리스 확인 중…", text_color=self.COLORS["muted"])
-        threading.Thread(target=self._update_worker, daemon=True).start()
+        self._start_worker(self._update_worker, name="update-check")
 
     def _update_worker(self) -> None:
         try:
@@ -1559,7 +1623,7 @@ class DownloaderApp(ctk.CTk):
             text="GitHub에서 설치 파일을 다운로드하는 중…", text_color=self.COLORS["muted"]
         )
         self.update_dialog.protocol("WM_DELETE_WINDOW", self._cancel_update_download)
-        threading.Thread(target=self._download_update_worker, args=(info,), daemon=True).start()
+        self._start_worker(self._download_update_worker, args=(info,), name="update-download")
 
     def _download_update_worker(self, info: UpdateInfo) -> None:
         try:
@@ -1659,6 +1723,9 @@ class DownloaderApp(ctk.CTk):
         """Immediately disconnect every request associated with edited inputs."""
         self.preview_sequence += 1
         self.preview_cancel_event.set()
+        self.events.discard_stale_preview_events(self.preview_sequence)
+        self._cleanup_ready_preview_caches(self.preview_cache.retire(self.gallery_cache_dir))
+        self.gallery_cache_dir = None
 
     def _cancel_preview_update(self) -> None:
         """Cancel the only tracked input invalidation before an explicit action."""
@@ -1755,14 +1822,17 @@ class DownloaderApp(ctk.CTk):
         self.preview_sequence += 1
         sequence = self.preview_sequence
         self.preview_cancel_event.set()
+        self._cleanup_ready_preview_caches(self.preview_cache.retire(self.gallery_cache_dir))
+        self.gallery_cache_dir = None
+        self.events.discard_stale_preview_events(sequence)
         self.preview_cancel_event = threading.Event()
         self.preview_config = config
         self._open_preview_selector(config)
-        threading.Thread(
-            target=self._cover_worker,
+        self._start_worker(
+            self._cover_worker,
             args=(config, sequence, self.preview_cancel_event),
-            daemon=True,
-        ).start()
+            name=f"preview-cover-{sequence}",
+        )
         referer_state = (
             f"Referer 적용: {urlparse(config.referer).netloc}"
             if config.referer
@@ -1795,9 +1865,24 @@ class DownloaderApp(ctk.CTk):
         )
         self.virtual_gallery.grid(row=2, column=0, padx=14, pady=(0, 14), sticky="nsew")
         self.virtual_gallery.grid_remove()
+        self.preview_gallery.protocol("WM_DELETE_WINDOW", self._hide_preview_gallery)
+
+    def _hide_preview_gallery(self) -> None:
+        self.preview_sequence += 1
+        self.preview_cancel_event.set()
+        self.events.discard_stale_preview_events(self.preview_sequence)
+        self._cleanup_ready_preview_caches(self.preview_cache.retire(self.gallery_cache_dir))
+        self.gallery_cache_dir = None
+        self.gallery_items = {}
+        if getattr(self, "virtual_gallery", None):
+            self.virtual_gallery.clear()
+        if getattr(self, "preview_gallery", None) and self.preview_gallery.winfo_exists():
+            self.preview_gallery.withdraw()
 
     def _open_preview_selector(self, config: DownloadConfig) -> None:
         self._ensure_preview_gallery()
+        self.preview_gallery.deiconify()
+        self.preview_gallery.lift()
         self.virtual_gallery.grid_remove()
         self.gallery_frame.grid()
         self.virtual_gallery.clear()
@@ -1849,42 +1934,46 @@ class DownloaderApp(ctk.CTk):
         except Exception as error:
             self._write_log(f"캐릭터 첫 이미지 표시 실패 [{character}]: {error}")
     def _load_preview_character(self, character: str) -> None:
-        if not self.preview_config:
+        if not self.preview_config or self._closing:
             return
         self.preview_sequence += 1
         sequence = self.preview_sequence
-        previous_cache = getattr(self, "gallery_cache_dir", None)
+        previous_cache = self.gallery_cache_dir
         self.preview_cancel_event.set()
+        self._cleanup_ready_preview_caches(self.preview_cache.retire(previous_cache))
+        self.events.discard_stale_preview_events(sequence)
         self.preview_cancel_event = threading.Event()
-        cache_dir = self.preview_cache_root / f"session-{sequence:08d}"
+        cache_dir = self.preview_cache.create(sequence)
         self.gallery_cache_dir = cache_dir
-        if previous_cache:
-            threading.Thread(target=self._cleanup_preview_cache, args=(previous_cache,), daemon=True).start()
         self.gallery_selected_character = character
         for name, button in self.gallery_tab_buttons.items():
             button.configure(fg_color=self.COLORS["accent"] if name == character else "#273450")
         self.events.put(("live_preview_start", (sequence, character, len(self.preview_config.expand_situations()))))
-        threading.Thread(target=self._live_preview_worker, args=(self.preview_config, character, sequence, self.preview_cancel_event, cache_dir), daemon=True).start()
+        self._start_worker(
+            self._live_preview_worker,
+            args=(self.preview_config, character, sequence, self.preview_cancel_event, cache_dir),
+            name=f"live-preview-{sequence}",
+        )
 
-    @staticmethod
-    def _cleanup_preview_cache(path: Path) -> None:
-        """Remove a stale session after cancellation without blocking Tk."""
-        waiter = threading.Event()
-        for _ in range(12):
-            shutil.rmtree(path, ignore_errors=True)
-            if not path.exists():
-                return
-            waiter.wait(0.25)
-
-
-    def _live_preview_worker(self, config: DownloadConfig, character: str, sequence: int, cancelled: threading.Event, cache_dir: Path) -> None:
+    def _live_preview_worker(
+        self,
+        config: DownloadConfig,
+        character: str,
+        sequence: int,
+        cancelled: threading.Event,
+        cache_dir: Path,
+    ) -> None:
         try:
             def on_item(index: int, item: PreviewImage) -> None:
-                self.events.put(("live_preview_item", (sequence, index, item)))
+                if not cancelled.is_set():
+                    self.events.put(("live_preview_item", (sequence, index, item)))
+
             batch = asyncio.run(fetch_live_previews(config, character, on_item, cancelled, cache_dir))
             self.events.put(("live_preview_done", (sequence, batch)))
         except Exception as error:
             self.events.put(("live_preview_error", (sequence, str(error))))
+        finally:
+            self.events.put(("preview_session_finished", (sequence, cache_dir)))
 
     @staticmethod
     def _thumbnail(data: bytes, size: tuple[int, int]) -> Image.Image:
@@ -2030,6 +2119,11 @@ class DownloaderApp(ctk.CTk):
 
     def _hide_original_viewer(self) -> None:
         self.viewer_sequence += 1
+        self._cleanup_ready_preview_caches(
+            self.preview_cache.unprotect(self.viewer_protected_cache)
+        )
+        self.viewer_protected_cache = None
+        self.viewer_current_item = None
         if getattr(self, "viewer_fullscreen", False):
             self.original_viewer.attributes("-fullscreen", False)
             self.viewer_fullscreen = False
@@ -2118,6 +2212,13 @@ class DownloaderApp(ctk.CTk):
         item = self.gallery_items.get(index)
         if item is None:
             return
+        cache_dir = item.cache_path.parent if item.cache_path else None
+        if cache_dir != self.viewer_protected_cache:
+            self._cleanup_ready_preview_caches(
+                self.preview_cache.unprotect(self.viewer_protected_cache)
+            )
+            self.preview_cache.protect(cache_dir)
+            self.viewer_protected_cache = cache_dir
         self.viewer_current_item = item
         self.viewer_canvas.delete("all")
         self.viewer_canvas.create_text(
@@ -2139,14 +2240,14 @@ class DownloaderApp(ctk.CTk):
             max(320, self.viewer_canvas.winfo_width() - 8),
             max(240, self.viewer_canvas.winfo_height() - 8),
         )
-        threading.Thread(
-            target=self._viewer_decode_worker,
+        self._start_worker(
+            self._viewer_decode_worker,
             args=(
                 sequence, item, viewport_size, self.viewer_mode, self.viewer_zoom,
                 self.viewer_position, len(self.viewer_indices),
             ),
-            daemon=True,
-        ).start()
+            name=f"viewer-decode-{sequence}",
+        )
 
     def _viewer_decode_worker(
         self,
@@ -2253,7 +2354,7 @@ class DownloaderApp(ctk.CTk):
         for index, favorite in enumerate(visible):
             card = ctk.CTkFrame(self.favorite_grid, corner_radius=16, fg_color=self.COLORS["surface"], border_width=1, border_color="#26314E")
             card.grid(row=index // 2, column=index % 2, padx=7, pady=7, sticky="nsew")
-            card.grid_columnconfigure((0, 1, 2), weight=1, uniform="favorite_action")
+            card.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="favorite_action")
             ctk.CTkButton(
                 card, text=favorite.name, anchor="w", height=32, corner_radius=9,
                 fg_color="transparent", hover_color="#273450", font=self._font(12, "bold"),
@@ -2269,6 +2370,8 @@ class DownloaderApp(ctk.CTk):
             ctk.CTkButton(card, text="삭제", width=48, height=29, corner_radius=9, fg_color="#342133", hover_color="#49283C", text_color="#FFB3C0", font=self._font(9), command=lambda value=favorite: self._delete_favorite(value)).grid(row=3, column=3, padx=(4, 10), pady=(0, 10))
 
     def _apply_favorite(self, favorite: FavoritePreset) -> None:
+        self._cancel_preview_update()
+        self._invalidate_preview_session()
         values = {
             "템플릿 URL": favorite.template_url,
             "캐릭터 코드": favorite.character,
@@ -2439,7 +2542,7 @@ class DownloaderApp(ctk.CTk):
         self.state_badge.configure(text="●  진행 중", fg_color="#293562", text_color="#B7C1FF")
         self.status.configure(text=f"0 / {len(config.expand_characters()) * len(config.expand_situations())}개를 준비했습니다.")
         self._write_log("다운로드 큐를 시작했습니다.")
-        threading.Thread(target=self._worker, args=(config,), daemon=True).start()
+        self._start_worker(self._worker, args=(config,), name="download-batch")
 
     def _worker(self, config: DownloadConfig) -> None:
         try:
@@ -2453,8 +2556,11 @@ class DownloaderApp(ctk.CTk):
         self.status.configure(text="취소 요청됨 — 진행 중인 연결을 정리합니다…")
 
     def _poll_events(self) -> None:
+        self.poll_after_id = None
+        if self._closing:
+            return
         # Drain bursts quickly, but cap each UI slice so input and scrolling stay responsive.
-        event_budget = 64 if self.events.qsize() > 24 else 16
+        event_budget = 96 if self.events.qsize() > 256 else (64 if self.events.qsize() > 24 else 16)
         for _ in range(event_budget):
             if self.events.empty():
                 break
@@ -2487,6 +2593,10 @@ class DownloaderApp(ctk.CTk):
                 sequence, message = payload
                 if sequence == self.preview_sequence:
                     self._clear_live_preview(f"미리보기를 불러오지 못했습니다. {message}")
+            elif kind == "preview_session_finished":
+                _sequence, cache_dir = payload
+                assert isinstance(cache_dir, Path)
+                self._cleanup_ready_preview_caches(self.preview_cache.finish(cache_dir))
             elif kind == "viewer_image":
                 sequence, item, ppm, original_size, display_size, position, total = payload
                 if sequence == self.viewer_sequence:
@@ -2523,30 +2633,48 @@ class DownloaderApp(ctk.CTk):
                     self._write_log(f"완료 — 성공 {stats.success}, 실패 {stats.failed}, 취소 {stats.cancelled}")
                 else:
                     self.state_badge.configure(text="●  오류", fg_color="#452536", text_color="#FF9CAD"); self._write_log(f"오류: {payload}")
-        self.after(12 if not self.events.empty() else 30, self._poll_events)
+        if not self._closing:
+            self.poll_after_id = self.after(12 if not self.events.empty() else 30, self._poll_events)
 
     def _write_log(self, message: str) -> None:
         self.log.insert("end", message + "\n"); self.log.see("end")
 
     def _on_close(self) -> None:
-        """Stop pending UI work so a standard installer close exits the process."""
+        """Cancel work, join tracked workers, and release Tk/cache resources once."""
+        if self._closing:
+            return
+        self._closing = True
         self.cancel_event.set()
         self.preview_cancel_event.set()
         if update_cancel := getattr(self, "update_download_cancel", None):
             update_cancel.set()
-        if viewer_render := getattr(self, "viewer_render_after_id", None):
-            self.after_cancel(viewer_render)
-            self.viewer_render_after_id = None
+
+        for attribute in ("poll_after_id", "viewer_render_after_id", "favorite_render_after_id"):
+            callback_id = getattr(self, attribute, None)
+            if callback_id:
+                try:
+                    self.after_cancel(callback_id)
+                except tk.TclError:
+                    pass
+                setattr(self, attribute, None)
         self._cancel_preview_update()
-        if gallery := getattr(self, "preview_gallery", None):
-            if gallery.winfo_exists():
-                gallery.destroy()
-        if viewer := getattr(self, "original_viewer", None):
-            if viewer.winfo_exists():
-                viewer.destroy()
-        shutil.rmtree(self.preview_cache_root, ignore_errors=True)
+
+        # Background tasks use finite network timeouts; cancellation plus a bounded
+        # join prevents leaked thread references without hanging application exit.
+        self.workers.close_and_join(timeout=2.5)
+        self.events.close()
+        self.preview_cache.close()
+
+        for window_name in ("preview_gallery", "original_viewer"):
+            window = getattr(self, window_name, None)
+            try:
+                if window is not None and window.winfo_exists():
+                    window.destroy()
+            except tk.TclError:
+                pass
         self.quit()
         self.destroy()
+
     def _open_folder(self) -> None:
         selected = self.folder_var.get().strip()
         if not selected:

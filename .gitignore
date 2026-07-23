@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-build/
+.pytest_cache/
 work/
 outputs/
 dist/
@@ -10,4 +12,3 @@ build/
 installer/LumaFetch.exe
 installer/*.sed
 %CD%/
-

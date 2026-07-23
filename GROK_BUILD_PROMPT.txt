@@ -1,0 +1,14 @@
+GitHub 저장소 https://github.com/scarlel96-design/LumaFetch 의 main 브랜치를 Windows x64 환경에 체크아웃한 뒤, 첨부한 LumaFetch-1.13.0-BUILD-READY.zip 내용을 저장소 루트에 덮어써라.
+
+이 패키지는 Luma Fetch 1.13.0 기능 구현과 테스트 작성이 이미 완료된 빌드 준비본이다. 새 기능 추가, UI 변경, 리팩터링, 전면 코드 리뷰를 하지 말고 빌드와 산출물 검증만 수행한다. 기존 저장소에 있는 installer/LumaFetch.ico는 삭제하거나 교체하지 말고 유지한다.
+
+저장소 루트에서 BUILD_RELEASE.cmd를 실행하라. 이 스크립트가 가상환경 생성, 의존성 설치, 테스트, compileall, PyInstaller 빌드, Inno Setup 설치/탐지, 설치 파일 컴파일, 버전 검증, SHA-256 생성을 수행한다.
+
+성공 조건은 다음 세 파일이 생성되는 것이다.
+- outputs/LumaFetch-Setup-1.13.0.exe
+- outputs/SHA256SUMS.txt
+- outputs/BUILD_INFO.txt
+
+빌드가 실패하면 애플리케이션 기능 코드(app.py, lumafetch 모듈, 테스트)는 임의로 수정하지 마라. 빌드 환경, 경로, PyInstaller 또는 Inno Setup 설정에 직접 관련된 최소 수정만 하고 BUILD_RELEASE.cmd를 처음부터 다시 실행하라.
+
+완료 후 LumaFetch-Setup-1.13.0.exe 파일 자체를 전달하고, SHA-256, 테스트 통과 개수, Python/PyInstaller/Inno Setup 버전, 실제 수정 파일과 수정 이유를 보고하라. GitHub Release 게시, 태그 생성, 버전 변경은 하지 마라.
