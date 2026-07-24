@@ -8,6 +8,7 @@
 - Custom favorite-name dialog centered over the main window.
 - Favorites cards show up to **4 character cover thumbnails** (disk-cached) for quick visual reference.
 - Favorite cover loading is more complete: sampled situation probes, parallel favorite fetches, per-character timeouts, and missing-slot markers.
+- Fixed zero-padding bug: `a0..13` now expands to `a0..a13` instead of `a00..a13`.
 
 ### Fixed
 
