@@ -49,13 +49,16 @@ def expand_code_expression(
             if count > max_range_items:
                 raise ValueError(f"한 범위는 최대 {max_range_items:,}개까지 가능합니다.")
 
-            width = (
-                max(len(start_text), len(end_text))
-                if start_text.startswith("0") or end_text.startswith("0")
-                else 0
-            )
+            # Zero-pad only when the user explicitly wrote padded digits (e.g. 01..50, s01..83).
+            # A bare "0" in a0..13 must stay a0,a1,...,a13 — not a00,a01.
+            # Padding is intentional only for multi-digit tokens that keep a leading zero.
+            def _explicit_pad_width(token: str) -> int:
+                return len(token) if len(token) > 1 and token.startswith("0") else 0
+
+            width = max(_explicit_pad_width(start_text), _explicit_pad_width(end_text))
             for number in range(start, end + 1):
-                values.setdefault(validate(f"{prefix}{number:0{width}d}"), None)
+                token = f"{number:0{width}d}" if width else str(number)
+                values.setdefault(validate(f"{prefix}{token}"), None)
 
         if max_total_items is not None and len(values) > max_total_items:
             raise ValueError(f"{item_label}는 최대 {max_total_items:,}개까지 입력할 수 있습니다.")
