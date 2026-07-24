@@ -1695,12 +1695,19 @@ class DownloaderApp(ctk.CTk):
         self.version_label.pack(side="bottom", anchor="w", padx=22, pady=(8, 18))
         self.update_status = ctk.CTkLabel(sidebar, text="", font=self._font(9), text_color=self.COLORS["muted"], wraplength=140, justify="left")
         self.update_status.pack(side="bottom", anchor="w", padx=22, pady=(2, 0))
+        # Packed bottom-up: version manager sits above update check.
+        self.version_manager_button = ctk.CTkButton(
+            sidebar, text="☰  버전 관리", width=142, height=32, corner_radius=11,
+            fg_color="#273450", hover_color="#334364", font=self._font(10, "bold"),
+            command=self._open_version_manager,
+        )
+        self.version_manager_button.pack(side="bottom", padx=16, pady=(6, 2))
         self.update_button = ctk.CTkButton(
-            sidebar, text="↻  버전 관리", width=142, height=32, corner_radius=11,
+            sidebar, text="↻  업데이트 확인", width=142, height=32, corner_radius=11,
             fg_color="#273450", hover_color="#334364", font=self._font(10, "bold"),
             command=self._check_for_updates,
         )
-        self.update_button.pack(side="bottom", padx=16, pady=(20, 2))
+        self.update_button.pack(side="bottom", padx=16, pady=(20, 0))
 
         self.download_view = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
         main = self.download_view
@@ -1935,24 +1942,79 @@ class DownloaderApp(ctk.CTk):
         if announce:
             self._clear_live_preview(f"즐겨찾기 수정 취소 · {name}")
 
+    def _set_release_action_busy(self, busy: bool, *, focus: Literal["update", "versions"] | None = None) -> None:
+        """Disable both release buttons while a GitHub request is in flight."""
+        if busy:
+            update_text = "확인 중…" if focus == "update" else "↻  업데이트 확인"
+            versions_text = "불러오는 중…" if focus == "versions" else "☰  버전 관리"
+            state = "disabled"
+        else:
+            update_text = "↻  업데이트 확인"
+            versions_text = "☰  버전 관리"
+            state = "normal"
+        if hasattr(self, "update_button"):
+            self.update_button.configure(state=state, text=update_text)
+        if hasattr(self, "version_manager_button"):
+            self.version_manager_button.configure(state=state, text=versions_text)
+
     def _check_for_updates(self) -> None:
+        """Check only the latest release and offer install when newer."""
         if self.update_checking:
             return
         self.update_checking = True
-        self.update_button.configure(state="disabled", text="불러오는 중…")
-        self.update_status.configure(text="GitHub 릴리스 목록 확인 중…", text_color=self.COLORS["muted"])
-        self._start_worker(self._update_worker, name="update-check")
+        self._set_release_action_busy(True, focus="update")
+        self.update_status.configure(text="최신 버전 확인 중…", text_color=self.COLORS["muted"])
+        self._start_worker(self._latest_update_worker, name="update-check")
 
-    def _update_worker(self) -> None:
+    def _open_version_manager(self) -> None:
+        """Open the full release list for upgrade / reinstall / downgrade."""
+        if self.update_checking:
+            return
+        self.update_checking = True
+        self._set_release_action_busy(True, focus="versions")
+        self.update_status.configure(text="릴리스 목록 불러오는 중…", text_color=self.COLORS["muted"])
+        self._start_worker(self._version_catalog_worker, name="version-catalog")
+
+    def _latest_update_worker(self) -> None:
+        try:
+            info = asyncio.run(fetch_latest_release())
+            self.events.put(("update_result", info))
+        except Exception as error:
+            self.events.put(("update_error", str(error)))
+
+    def _version_catalog_worker(self) -> None:
         try:
             releases = asyncio.run(fetch_release_catalog())
             self.events.put(("release_catalog", releases))
         except Exception as error:
-            self.events.put(("update_error", str(error)))
+            self.events.put(("version_catalog_error", str(error)))
+
+    def _handle_update_result(self, info: UpdateInfo) -> None:
+        self.update_checking = False
+        self._set_release_action_busy(False)
+        current = parse_release_version(APP_VERSION)
+        if current is None:
+            self.update_status.configure(text="현재 버전 확인 불가", text_color=self.COLORS["danger"])
+            return
+        if info.version > current:
+            self.update_status.configure(text=f"새 버전 {info.tag_name}", text_color=self.COLORS["success"])
+            self._show_update_dialog(info)
+        elif info.version == current:
+            self.update_status.configure(text="현재 최신 버전입니다.", text_color=self.COLORS["success"])
+            self._write_log(f"업데이트 확인: 최신 버전입니다 ({info.tag_name}).")
+        else:
+            self.update_status.configure(
+                text=f"개발 버전 · 공개 {info.tag_name}",
+                text_color=self.COLORS["muted"],
+            )
+            self._write_log(
+                f"업데이트 확인: 로컬 v{APP_VERSION}이 공개 {info.tag_name}보다 높습니다. "
+                "다운그레이드는 버전 관리에서 할 수 있습니다."
+            )
 
     def _handle_release_catalog(self, releases: list[UpdateInfo]) -> None:
         self.update_checking = False
-        self.update_button.configure(state="normal", text="↻  버전 관리")
+        self._set_release_action_busy(False)
         current = parse_release_version(APP_VERSION)
         if current is None:
             self.update_status.configure(text="현재 버전 확인 불가", text_color=self.COLORS["danger"])
@@ -1968,7 +2030,13 @@ class DownloaderApp(ctk.CTk):
 
     def _handle_update_error(self, message: str) -> None:
         self.update_checking = False
-        self.update_button.configure(state="normal", text="↻  버전 관리")
+        self._set_release_action_busy(False)
+        self.update_status.configure(text="업데이트 확인 실패", text_color=self.COLORS["danger"])
+        self._write_log(f"업데이트 확인 실패: {message}")
+
+    def _handle_version_catalog_error(self, message: str) -> None:
+        self.update_checking = False
+        self._set_release_action_busy(False)
         self.update_status.configure(text="버전 목록 확인 실패", text_color=self.COLORS["danger"])
         self._write_log(f"버전 목록 확인 실패: {message}")
 
@@ -3774,11 +3842,16 @@ class DownloaderApp(ctk.CTk):
                     self.viewer_canvas.delete("all")
                     self.viewer_canvas.create_text(max(1, self.viewer_canvas.winfo_width()) // 2, max(1, self.viewer_canvas.winfo_height()) // 2, text="원본 이미지를 표시할 수 없습니다.", fill="#AAB7D8", font=("Segoe UI Variable", 13))
                     self.viewer_summary.configure(text=f"{item.character} / {item.situation} · {message}")
+            elif kind == "update_result":
+                assert isinstance(payload, UpdateInfo)
+                self._handle_update_result(payload)
             elif kind == "release_catalog":
                 assert isinstance(payload, list)
                 self._handle_release_catalog(payload)
             elif kind == "update_error":
                 self._handle_update_error(str(payload))
+            elif kind == "version_catalog_error":
+                self._handle_version_catalog_error(str(payload))
             elif kind == "update_download_progress":
                 downloaded, total = payload
                 self._handle_update_download_progress(int(downloaded), int(total))
