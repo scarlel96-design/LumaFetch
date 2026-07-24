@@ -7,7 +7,7 @@
 - Multi-outfit support: comma/ranges in the outfit field expand to separate jobs (`A1,E1,E2`).
 - Clearer download filenames: `{character}_{outfit}_{situation}.ext`.
 - Hard cap with a clear error when total job combinations exceed 100,000.
-- Separate sidebar actions: **업데이트 확인** (latest only) and **버전 관리** (full release list).
+- Separate sidebar actions: **업데이트 확인** (latest only) and **버전 관리** (full release list only; no latest-update comparison).
 
 ### Fixed
 

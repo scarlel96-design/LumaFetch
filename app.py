@@ -1943,19 +1943,22 @@ class DownloaderApp(ctk.CTk):
             self._clear_live_preview(f"즐겨찾기 수정 취소 · {name}")
 
     def _set_release_action_busy(self, busy: bool, *, focus: Literal["update", "versions"] | None = None) -> None:
-        """Disable both release buttons while a GitHub request is in flight."""
-        if busy:
-            update_text = "확인 중…" if focus == "update" else "↻  업데이트 확인"
-            versions_text = "불러오는 중…" if focus == "versions" else "☰  버전 관리"
-            state = "disabled"
+        """Busy-state only the action that was pressed; leave the other idle-labeled."""
+        if not hasattr(self, "update_button") or not hasattr(self, "version_manager_button"):
+            return
+        if not busy:
+            self.update_button.configure(state="normal", text="↻  업데이트 확인")
+            self.version_manager_button.configure(state="normal", text="☰  버전 관리")
+            return
+        if focus == "update":
+            self.update_button.configure(state="disabled", text="확인 중…")
+            self.version_manager_button.configure(state="disabled", text="☰  버전 관리")
+        elif focus == "versions":
+            self.update_button.configure(state="disabled", text="↻  업데이트 확인")
+            self.version_manager_button.configure(state="disabled", text="불러오는 중…")
         else:
-            update_text = "↻  업데이트 확인"
-            versions_text = "☰  버전 관리"
-            state = "normal"
-        if hasattr(self, "update_button"):
-            self.update_button.configure(state=state, text=update_text)
-        if hasattr(self, "version_manager_button"):
-            self.version_manager_button.configure(state=state, text=versions_text)
+            self.update_button.configure(state="disabled", text="↻  업데이트 확인")
+            self.version_manager_button.configure(state="disabled", text="☰  버전 관리")
 
     def _check_for_updates(self) -> None:
         """Check only the latest release and offer install when newer."""
@@ -1967,7 +1970,7 @@ class DownloaderApp(ctk.CTk):
         self._start_worker(self._latest_update_worker, name="update-check")
 
     def _open_version_manager(self) -> None:
-        """Open the full release list for upgrade / reinstall / downgrade."""
+        """Open the full release list only — no latest-update comparison dialog."""
         if self.update_checking:
             return
         self.update_checking = True
@@ -2013,19 +2016,17 @@ class DownloaderApp(ctk.CTk):
             )
 
     def _handle_release_catalog(self, releases: list[UpdateInfo]) -> None:
+        """Version manager only: open the list UI without update-check messaging."""
         self.update_checking = False
         self._set_release_action_busy(False)
-        current = parse_release_version(APP_VERSION)
-        if current is None:
-            self.update_status.configure(text="현재 버전 확인 불가", text_color=self.COLORS["danger"])
+        if not releases:
+            self.update_status.configure(text="표시할 릴리스가 없습니다.", text_color=self.COLORS["muted"])
+            self._write_log("버전 관리: 표시할 공개 릴리스가 없습니다.")
             return
-        latest = releases[0]
-        if latest.version > current:
-            self.update_status.configure(text=f"새 버전 {latest.tag_name}", text_color=self.COLORS["success"])
-        elif latest.version == current:
-            self.update_status.configure(text="현재 최신 버전입니다.", text_color=self.COLORS["success"])
-        else:
-            self.update_status.configure(text=f"개발 버전 · 공개 {latest.tag_name}", text_color=self.COLORS["muted"])
+        self.update_status.configure(
+            text=f"릴리스 {len(releases)}개",
+            text_color=self.COLORS["muted"],
+        )
         self._show_version_browser(releases)
 
     def _handle_update_error(self, message: str) -> None:
@@ -2037,8 +2038,8 @@ class DownloaderApp(ctk.CTk):
     def _handle_version_catalog_error(self, message: str) -> None:
         self.update_checking = False
         self._set_release_action_busy(False)
-        self.update_status.configure(text="버전 목록 확인 실패", text_color=self.COLORS["danger"])
-        self._write_log(f"버전 목록 확인 실패: {message}")
+        self.update_status.configure(text="버전 목록 불러오기 실패", text_color=self.COLORS["danger"])
+        self._write_log(f"버전 관리 실패: {message}")
 
     def _install_action_label(self, info: UpdateInfo) -> str:
         current = parse_release_version(APP_VERSION)
