@@ -7,6 +7,7 @@
 - **버전 관리** panel lists every published GitHub release in a scroll view and supports update, reinstall, or **downgrade** with the same trusted installer pipeline.
 - Custom favorite-name dialog centered over the main window.
 - Favorites cards show up to **4 character cover thumbnails** (disk-cached) for quick visual reference.
+- Favorite cover loading is more complete: sampled situation probes, parallel favorite fetches, per-character timeouts, and missing-slot markers.
 
 ### Fixed
 

@@ -50,8 +50,11 @@ MAX_FAVORITES = 1000
 FAVORITES_PAGE_SIZE = 20
 FAVORITE_CARD_BATCH_SIZE = 6
 FAVORITE_COVER_LIMIT = 4
-FAVORITE_COVER_SITUATION_PROBES = 8
+FAVORITE_COVER_SITUATION_PROBES = 28
 FAVORITE_COVER_SIZE = (72, 64)
+FAVORITE_COVER_CHAR_TIMEOUT = 14.0
+FAVORITE_COVER_FAVORITE_CONCURRENCY = 3
+FAVORITE_COVER_CHAR_CONCURRENCY = 4
 FAVORITE_COVER_CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LumaFetch" / "favorite_covers"
 MAX_CHARACTER_CODES = 1000
 MAX_CHARACTER_CODE_LENGTH = 120
@@ -913,6 +916,42 @@ async def fetch_live_previews(
     requested = success + failed
     return PreviewBatch(total=total, requested=requested, success=success, failed=failed, errors=errors)
 
+def sample_probe_values(values: list[str], limit: int) -> list[str]:
+    """Keep early values and evenly sample the rest so sparse ranges still hit real images."""
+    if limit <= 0 or not values:
+        return []
+    if len(values) <= limit:
+        return list(values)
+    if limit == 1:
+        return [values[0]]
+    # Always keep a short head (common first codes), then spread across the full list.
+    head_count = min(4, limit - 1)
+    selected: list[str] = []
+    seen: set[str] = set()
+    for value in values[:head_count]:
+        if value not in seen:
+            selected.append(value)
+            seen.add(value)
+    remaining_slots = limit - len(selected)
+    if remaining_slots > 0:
+        last_index = len(values) - 1
+        for step in range(remaining_slots):
+            index = round(step * last_index / max(1, remaining_slots - 1)) if remaining_slots > 1 else last_index
+            value = values[index]
+            if value not in seen:
+                selected.append(value)
+                seen.add(value)
+    # Fill any gaps if sampling collided.
+    if len(selected) < limit:
+        for value in values:
+            if value not in seen:
+                selected.append(value)
+                seen.add(value)
+            if len(selected) >= limit:
+                break
+    return selected[:limit]
+
+
 async def fetch_preview_covers(
     config: DownloadConfig,
     on_item: Callable[[str, PreviewImage], None],
@@ -921,46 +960,77 @@ async def fetch_preview_covers(
     max_characters: int | None = None,
     max_situation_probes: int | None = None,
     thumbnail_size: tuple[int, int] = (132, 118),
+    character_timeout: float | None = None,
+    skip_characters: set[str] | None = None,
 ) -> None:
     """Find the first existing image for each character selector card."""
     characters = config.expand_characters()
     if max_characters is not None:
         characters = characters[: max(0, max_characters)]
-    situations = config.expand_situations()
-    if max_situation_probes is not None:
-        situations = situations[: max(0, max_situation_probes)]
+    if skip_characters:
+        characters = [character for character in characters if character not in skip_characters]
+    all_situations = config.expand_situations()
+    situations = (
+        sample_probe_values(all_situations, max_situation_probes)
+        if max_situation_probes is not None
+        else list(all_situations)
+    )
     if not characters or not situations:
         return
     probe = Downloader(config, threading.Event(), lambda _kind, _payload: None)
-    semaphore = asyncio.Semaphore(4)
-    connector = aiohttp.TCPConnector(limit=4, limit_per_host=4, ttl_dns_cache=300, resolver=PublicResolver())
-    timeout = aiohttp.ClientTimeout(total=20, connect=8, sock_read=15)
+    semaphore = asyncio.Semaphore(FAVORITE_COVER_CHAR_CONCURRENCY)
+    connector = aiohttp.TCPConnector(
+        limit=FAVORITE_COVER_CHAR_CONCURRENCY * 2,
+        limit_per_host=FAVORITE_COVER_CHAR_CONCURRENCY * 2,
+        ttl_dns_cache=300,
+        resolver=PublicResolver(),
+    )
+    timeout = aiohttp.ClientTimeout(total=30, connect=8, sock_read=12)
     headers = make_request_headers(None)
     request_policy = ImageRequestPolicy(config.explicit_referer())
 
-    async def one(session: aiohttp.ClientSession, character: str) -> None:
+    async def probe_character(session: aiohttp.ClientSession, character: str) -> None:
         async with semaphore:
-            for situation in situations:
-                for candidate in probe.situation_candidates(situation):
-                    if cancelled.is_set():
-                        return
-                    url = probe.make_url(character, candidate)
-                    try:
-                        response = await request_policy.get(session, url, allow_redirects=False)
-                        async with response:
-                            if response.status != 200 or not response.content_type.startswith("image/"):
-                                continue
-                            data = await read_image_response(response)
-                            if not SecurityGuard.has_safe_image_signature(data[:32]):
-                                continue
-                            thumbnail = await asyncio.to_thread(encode_thumbnail_ppm, data, thumbnail_size)
-                            on_item(character, PreviewImage(character, situation, url, thumbnail_ppm=thumbnail))
+            if cancelled.is_set():
+                return
+
+            async def search() -> None:
+                for situation in situations:
+                    for candidate in probe.situation_candidates(situation):
+                        if cancelled.is_set():
                             return
-                    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                        continue
+                        url = probe.make_url(character, candidate)
+                        try:
+                            response = await request_policy.get(session, url, allow_redirects=False)
+                            async with response:
+                                if response.status == 404:
+                                    continue
+                                if response.status != 200 or not response.content_type.startswith("image/"):
+                                    continue
+                                data = await read_image_response(response)
+                                if not SecurityGuard.has_safe_image_signature(data[:32]):
+                                    continue
+                                thumbnail = await asyncio.to_thread(
+                                    encode_thumbnail_ppm, data, thumbnail_size
+                                )
+                                on_item(
+                                    character,
+                                    PreviewImage(character, situation, url, thumbnail_ppm=thumbnail),
+                                )
+                                return
+                        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                            continue
+
+            if character_timeout and character_timeout > 0:
+                try:
+                    await asyncio.wait_for(search(), timeout=character_timeout)
+                except asyncio.TimeoutError:
+                    return
+            else:
+                await search()
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
-        await asyncio.gather(*(one(session, character) for character in characters))
+        await asyncio.gather(*(probe_character(session, character) for character in characters))
 
 
 def favorite_cover_fingerprint(favorite: FavoritePreset) -> str:
@@ -3098,50 +3168,39 @@ class DownloaderApp(ctk.CTk):
         try:
             if not slot.winfo_exists():
                 return
-            slot.configure(image=photo, text="", width=FAVORITE_COVER_SIZE[0], height=FAVORITE_COVER_SIZE[1])
+            # Clear text-cell sizing so PPM pixels render fully.
+            slot.configure(image=photo, text="", width=0, height=0, cursor="hand2")
             slot.image = photo
-            if character:
-                slot.configure(cursor="hand2")
+        except tk.TclError:
+            return
+
+    def _mark_favorite_cover_empty(self, fingerprint: str, slot_index: int) -> None:
+        slots = self.favorite_cover_targets.get(fingerprint)
+        if not slots or slot_index < 0 or slot_index >= len(slots):
+            return
+        slot = slots[slot_index]
+        try:
+            if not slot.winfo_exists():
+                return
+            if getattr(slot, "image", None):
+                return
+            slot.configure(text="-", fg="#4A5674")
         except tk.TclError:
             return
 
     def _start_favorite_cover_loads(self, favorites: list[FavoritePreset], token: int) -> None:
         if token != self.favorite_render_token or not favorites:
             return
+        # Keep a dedicated cancel token for this page load only.
         self.favorite_cover_cancel = threading.Event()
         self.favorite_cover_sequence += 1
         sequence = self.favorite_cover_sequence
-        pending: list[FavoritePreset] = []
+        pending: list[tuple[FavoritePreset, str, dict[int, bytes], list[str]]] = []
         for favorite in favorites:
             fingerprint = favorite_cover_fingerprint(favorite)
             cached = self._read_favorite_cover_cache(fingerprint)
             for slot_index, ppm in cached.items():
                 self._apply_favorite_cover_image(fingerprint, slot_index, ppm)
-            if len(cached) < min(FAVORITE_COVER_LIMIT, max(1, len(favorite.character.split(",")))):
-                # Still try network for missing slots (expanded count decided in worker).
-                if len(cached) < FAVORITE_COVER_LIMIT:
-                    pending.append(favorite)
-        if pending:
-            self._start_worker(
-                self._favorite_covers_worker,
-                args=(pending, sequence, token, self.favorite_cover_cancel),
-                name=f"favorite-covers-{sequence}",
-            )
-
-    def _favorite_covers_worker(
-        self,
-        favorites: list[FavoritePreset],
-        sequence: int,
-        token: int,
-        cancelled: threading.Event,
-    ) -> None:
-        for favorite in favorites:
-            if cancelled.is_set() or self._closing:
-                return
-            fingerprint = favorite_cover_fingerprint(favorite)
-            cached = self._read_favorite_cover_cache(fingerprint)
-            if len(cached) >= FAVORITE_COVER_LIMIT:
-                continue
             try:
                 config = DownloadConfig(
                     template_url=favorite.template_url,
@@ -3157,39 +3216,129 @@ class DownloaderApp(ctk.CTk):
                     retries=1,
                 )
                 characters = config.expand_characters()[:FAVORITE_COVER_LIMIT]
-                if not characters:
-                    continue
-                # Narrow character list so only the first few covers are fetched.
-                probe_config = config.model_copy(update={"character": ",".join(characters)})
-                slot_by_character = {name: index for index, name in enumerate(characters)}
-
-                def on_cover(character: str, item: PreviewImage, *, fp: str = fingerprint) -> None:
-                    if cancelled.is_set() or item.thumbnail_ppm is None:
-                        return
-                    slot_index = slot_by_character.get(character)
-                    if slot_index is None:
-                        return
-                    self._write_favorite_cover_cache(fp, slot_index, item.thumbnail_ppm)
-                    self.events.put(
-                        (
-                            "favorite_cover_item",
-                            (sequence, token, fp, slot_index, character, item.thumbnail_ppm),
-                        )
-                    )
-
-                asyncio.run(
-                    fetch_preview_covers(
-                        probe_config,
-                        on_cover,
-                        cancelled,
-                        max_characters=FAVORITE_COVER_LIMIT,
-                        max_situation_probes=FAVORITE_COVER_SITUATION_PROBES,
-                        thumbnail_size=FAVORITE_COVER_SIZE,
-                    )
-                )
-            except Exception:
-                # Cover strip is best-effort reference UI; never block favorites.
+            except (ValidationError, ValueError):
                 continue
+            if not characters:
+                continue
+            missing = [characters[index] for index in range(len(characters)) if index not in cached]
+            if missing:
+                pending.append((favorite, fingerprint, cached, characters))
+            else:
+                # Fill unused trailing slots when the favorite has fewer than 4 characters.
+                for slot_index in range(len(characters), FAVORITE_COVER_LIMIT):
+                    self._mark_favorite_cover_empty(fingerprint, slot_index)
+        if pending:
+            self._start_worker(
+                self._favorite_covers_worker,
+                args=(pending, sequence, token, self.favorite_cover_cancel),
+                name=f"favorite-covers-{sequence}",
+            )
+
+    def _favorite_covers_worker(
+        self,
+        pending: list[tuple[FavoritePreset, str, dict[int, bytes], list[str]]],
+        sequence: int,
+        token: int,
+        cancelled: threading.Event,
+    ) -> None:
+        """Load missing cover slots with limited parallel favorite probes."""
+
+        async def process_all() -> None:
+            favorite_sem = asyncio.Semaphore(FAVORITE_COVER_FAVORITE_CONCURRENCY)
+
+            async def process_one(
+                favorite: FavoritePreset,
+                fingerprint: str,
+                cached: dict[int, bytes],
+                characters: list[str],
+            ) -> None:
+                async with favorite_sem:
+                    if cancelled.is_set() or self._closing:
+                        return
+                    try:
+                        config = DownloadConfig(
+                            template_url=favorite.template_url,
+                            character=",".join(characters),
+                            ranges=favorite.ranges,
+                            outfit=favorite.outfit,
+                            referer_mode=favorite.referer_mode,
+                            referer=favorite.referer if favorite.referer_mode == "manual" else None,
+                            destination=Path.cwd(),
+                            separate_character_folders=favorite.separate_character_folders,
+                            scan_with_defender=False,
+                            concurrency=4,
+                            retries=1,
+                        )
+                    except (ValidationError, ValueError):
+                        return
+
+                    slot_by_character = {name: index for index, name in enumerate(characters)}
+                    already = {
+                        characters[index]
+                        for index in cached
+                        if 0 <= index < len(characters)
+                    }
+                    found: set[str] = set(already)
+
+                    def on_cover(character: str, item: PreviewImage) -> None:
+                        if cancelled.is_set() or item.thumbnail_ppm is None:
+                            return
+                        slot_index = slot_by_character.get(character)
+                        if slot_index is None:
+                            return
+                        found.add(character)
+                        self._write_favorite_cover_cache(fingerprint, slot_index, item.thumbnail_ppm)
+                        self.events.put(
+                            (
+                                "favorite_cover_item",
+                                (sequence, token, fingerprint, slot_index, character, item.thumbnail_ppm),
+                            )
+                        )
+
+                    try:
+                        await fetch_preview_covers(
+                            config,
+                            on_cover,
+                            cancelled,
+                            max_characters=FAVORITE_COVER_LIMIT,
+                            max_situation_probes=FAVORITE_COVER_SITUATION_PROBES,
+                            thumbnail_size=FAVORITE_COVER_SIZE,
+                            character_timeout=FAVORITE_COVER_CHAR_TIMEOUT,
+                            skip_characters=already,
+                        )
+                    except Exception:
+                        pass
+
+                    if cancelled.is_set():
+                        return
+                    # Mark unresolved slots so the strip does not look "stuck loading".
+                    for slot_index, character in enumerate(characters):
+                        if character not in found:
+                            self.events.put(
+                                (
+                                    "favorite_cover_empty",
+                                    (sequence, token, fingerprint, slot_index),
+                                )
+                            )
+                    for slot_index in range(len(characters), FAVORITE_COVER_LIMIT):
+                        self.events.put(
+                            (
+                                "favorite_cover_empty",
+                                (sequence, token, fingerprint, slot_index),
+                            )
+                        )
+
+            await asyncio.gather(
+                *(
+                    process_one(favorite, fingerprint, cached, characters)
+                    for favorite, fingerprint, cached, characters in pending
+                )
+            )
+
+        try:
+            asyncio.run(process_all())
+        except Exception:
+            return
 
     def _apply_favorite(self, favorite: FavoritePreset) -> None:
         self._cancel_preview_update()
@@ -3488,6 +3637,10 @@ class DownloaderApp(ctk.CTk):
                         bytes(ppm),
                         character=str(character),
                     )
+            elif kind == "favorite_cover_empty":
+                sequence, token, fingerprint, slot_index = payload
+                if sequence == self.favorite_cover_sequence and token == self.favorite_render_token:
+                    self._mark_favorite_cover_empty(str(fingerprint), int(slot_index))
             elif kind == "live_preview_start":
                 sequence, character, total = payload
                 if sequence == self.preview_sequence:
