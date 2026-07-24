@@ -36,7 +36,7 @@ from lumafetch.runtime import PreviewCacheManager, UiEventBus, WorkerRegistry
 from lumafetch.storage import atomic_write_json, cleanup_stale_part_files, load_validated_json_list
 
 
-APP_VERSION = "1.13.2"
+APP_VERSION = "1.14.0"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases"
@@ -59,6 +59,11 @@ FAVORITE_COVER_CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "
 MAX_CHARACTER_CODES = 1000
 MAX_CHARACTER_CODE_LENGTH = 120
 MAX_CHARACTER_LIST_LENGTH = 131_072
+MAX_OUTFIT_CODES = 200
+MAX_OUTFIT_CODE_LENGTH = 80
+MAX_DOWNLOAD_JOBS = 100_000
+# Status codes that mean "hotlink / auth wall" and should trigger auto-Referer probes.
+HOTLINK_BLOCK_STATUSES = frozenset({401, 403})
 def runtime_asset(name: str) -> Path:
     """Return a bundled PyInstaller asset or its source-tree equivalent."""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -193,7 +198,7 @@ class ImageRequestPolicy:
                 )
 
             bare = await session.get(url, headers=self._referer_headers(None), **kwargs)
-            if bare.status != 403 or not self.auto_candidates:
+            if bare.status not in HOTLINK_BLOCK_STATUSES or not self.auto_candidates:
                 self._resolved[host] = None
                 return bare
             self._safe_release(bare)
@@ -209,31 +214,53 @@ class ImageRequestPolicy:
                 except BaseException as error:  # noqa: BLE001 - collect per-candidate failures
                     return referer, error
 
+            def response_score(response: aiohttp.ClientResponse) -> int:
+                """Prefer real images over bare non-block statuses (e.g. 404 HTML)."""
+                if response.status in HOTLINK_BLOCK_STATUSES:
+                    return -1
+                content_type = (response.content_type or "").casefold()
+                if response.status == 200 and content_type.startswith("image/"):
+                    return 3
+                if response.status == 200:
+                    return 2
+                if response.status < 400:
+                    return 1
+                return 0
+
             # Parallel compare-and-assign so multi-platform discovery stays snappy.
             probed = await asyncio.gather(*(probe(referer) for referer in self.auto_candidates))
-            chosen_referer: str | None = None
-            chosen_response: aiohttp.ClientResponse | None = None
+            ranked: list[tuple[int, int, str, aiohttp.ClientResponse]] = []
             fallback_forbidden: aiohttp.ClientResponse | None = None
+            leftovers: list[aiohttp.ClientResponse] = []
 
-            for referer, result in probed:
+            for order, (referer, result) in enumerate(probed):
                 if isinstance(result, BaseException):
                     continue
-                if chosen_response is None and result.status != 403:
-                    chosen_referer = referer
-                    chosen_response = result
+                score = response_score(result)
+                if score < 0:
+                    if fallback_forbidden is None:
+                        fallback_forbidden = result
+                    else:
+                        leftovers.append(result)
                     continue
-                if fallback_forbidden is None and result.status == 403:
-                    fallback_forbidden = result
-                    continue
-                self._safe_release(result)
+                ranked.append((score, -order, referer, result))
 
-            if chosen_response is not None:
-                self._safe_release(fallback_forbidden)
+            ranked.sort(reverse=True)
+            if ranked:
+                _score, _order, chosen_referer, chosen_response = ranked[0]
+                for _s, _o, _r, response in ranked[1:]:
+                    leftovers.append(response)
+                if fallback_forbidden is not None:
+                    leftovers.append(fallback_forbidden)
+                for response in leftovers:
+                    self._safe_release(response)
                 self._resolved[host] = chosen_referer
                 if chosen_referer and self.on_detected:
                     self.on_detected(host, chosen_referer)
                 return chosen_response
 
+            for response in leftovers:
+                self._safe_release(response)
             # Every candidate stayed forbidden or failed — cache empty so we do not re-scan.
             self._resolved[host] = None
             if fallback_forbidden is not None:
@@ -377,10 +404,31 @@ class DownloadConfig(BaseModel):
     @field_validator("outfit")
     @classmethod
     def normalize_outfit(cls, value: str) -> str:
-        value = value.strip() or "X"
-        if any(char in value for char in r'\\/:*?"<>|'):
-            raise ValueError("의상 코드에는 파일명에 사용할 수 없는 문자를 쓸 수 없습니다.")
-        return value
+        """Accept one or many outfit codes (comma / ranges), same style as characters."""
+        raw = (value or "").strip() or "X"
+        raw_codes = [code.strip() for code in raw.split(",") if code.strip()]
+        if not raw_codes:
+            raw_codes = ["X"]
+
+        def validate_outfit_code(code: str) -> str:
+            if len(code) > MAX_OUTFIT_CODE_LENGTH:
+                raise ValueError(f"각 의상 코드는 최대 {MAX_OUTFIT_CODE_LENGTH}자까지 입력할 수 있습니다.")
+            if code in {".", ".."}:
+                raise ValueError("의상 코드로 . 또는 ..은 사용할 수 없습니다.")
+            if any(char in code for char in r'\/:*?"<>|'):
+                raise ValueError("의상 코드에는 파일명에 사용할 수 없는 문자를 쓸 수 없습니다.")
+            return code
+
+        codes = expand_code_expression(
+            ",".join(raw_codes),
+            validate=validate_outfit_code,
+            max_range_items=MAX_OUTFIT_CODES,
+            max_total_items=MAX_OUTFIT_CODES,
+            item_label="의상 코드",
+        )
+        if len(codes) > MAX_OUTFIT_CODES:
+            raise ValueError(f"의상 코드는 최대 {MAX_OUTFIT_CODES:,}개까지 입력할 수 있습니다.")
+        return ",".join(codes)
 
     @model_validator(mode="after")
     def validate_template_and_ranges(self) -> DownloadConfig:
@@ -388,10 +436,32 @@ class DownloadConfig(BaseModel):
         if not any(marker in self.template_url for marker in known):
             raise ValueError("템플릿에는 {char}, {pose}, {situation}, {outfit} 중 하나가 필요합니다.")
         self.expand_situations()  # validates every range
+        self.expand_outfits()
+        jobs = self.job_count()
+        if jobs > MAX_DOWNLOAD_JOBS:
+            raise ValueError(
+                f"요청 조합이 너무 많습니다 ({jobs:,}개). "
+                f"캐릭터·의상·상황 범위를 줄이세요 (최대 {MAX_DOWNLOAD_JOBS:,}개)."
+            )
         return self
 
     def expand_characters(self) -> list[str]:
         return self.character.split(",")
+
+    def expand_outfits(self) -> list[str]:
+        return [code for code in self.outfit.split(",") if code]
+
+    def uses_outfit_dimension(self) -> bool:
+        """True when multi-outfit should create separate download jobs."""
+        return "{outfit}" in self.template_url or "{pose}" in self.template_url
+
+    def active_outfits(self) -> list[str]:
+        """Outfits that affect the URL; templates without outfit/pose use one code only."""
+        outfits = self.expand_outfits()
+        if self.uses_outfit_dimension():
+            return outfits
+        return outfits[:1] or ["X"]
+
     @staticmethod
     def validate_situation_code(code: str) -> str:
         if not code or code in {".", ".."}:
@@ -406,6 +476,13 @@ class DownloadConfig(BaseModel):
             validate=self.validate_situation_code,
             max_range_items=100_001,
             item_label="상황 코드",
+        )
+
+    def job_count(self) -> int:
+        return (
+            len(self.expand_characters())
+            * len(self.active_outfits())
+            * len(self.expand_situations())
         )
 
 
@@ -775,7 +852,12 @@ async def fetch_live_previews(
 ) -> PreviewBatch:
     """Stream previews through separate, backpressured network and decode pipelines."""
     situations = config.expand_situations()
-    total = len(situations)
+    outfits = config.active_outfits()
+    # One gallery tile per situation×outfit so multi-outfit favorites preview correctly.
+    jobs: list[tuple[str, str]] = [
+        (situation, outfit) for outfit in outfits for situation in situations
+    ]
+    total = len(jobs)
     probe = Downloader(config, threading.Event(), lambda _kind, _payload: None)
     network_workers = min(16, max(1, total))
     decode_workers = min(4, max(1, total))
@@ -809,12 +891,17 @@ async def fetch_live_previews(
             return "Timeout: the image server did not respond in time."
         return str(error)
 
-    async def fetch_one(session: aiohttp.ClientSession, situation: str) -> tuple[PreviewImage | None, str | None]:
+    async def fetch_one(
+        session: aiohttp.ClientSession,
+        situation: str,
+        outfit: str,
+    ) -> tuple[PreviewImage | None, str | None]:
         last_error: Exception | None = None
+        label = situation if len(outfits) == 1 else f"{outfit}/{situation}"
         for candidate in probe.situation_candidates(situation):
             if cancelled.is_set():
                 return None, None
-            url = probe.make_url(character, candidate)
+            url = probe.make_url(character, candidate, outfit)
             try:
                 response = await request_policy.get(session, url, allow_redirects=False)
                 async with response:
@@ -830,7 +917,7 @@ async def fetch_live_previews(
                     data = await read_image_response(response)
                     if not SecurityGuard.has_safe_image_signature(data[:32]):
                         raise ValueError("Image signature is not allowed.")
-                    return PreviewImage(character, situation, url, data=data), None
+                    return PreviewImage(character, label, url, data=data), None
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as error:
                 last_error = error
         return None, reason(last_error or RuntimeError("Unknown preview failure."))
@@ -847,7 +934,8 @@ async def fetch_live_previews(
                     return
                 index = next_index
                 next_index += 1
-            item, error = await fetch_one(session, situations[index])
+            situation, outfit = jobs[index]
+            item, error = await fetch_one(session, situation, outfit)
             if cancelled.is_set():
                 return
             if item is not None:
@@ -999,27 +1087,28 @@ async def fetch_preview_covers(
                     for candidate in probe.situation_candidates(situation):
                         if cancelled.is_set():
                             return
-                        url = probe.make_url(character, candidate)
-                        try:
-                            response = await request_policy.get(session, url, allow_redirects=False)
-                            async with response:
-                                if response.status == 404:
-                                    continue
-                                if response.status != 200 or not response.content_type.startswith("image/"):
-                                    continue
-                                data = await read_image_response(response)
-                                if not SecurityGuard.has_safe_image_signature(data[:32]):
-                                    continue
-                                thumbnail = await asyncio.to_thread(
-                                    encode_thumbnail_ppm, data, thumbnail_size
-                                )
-                                on_item(
-                                    character,
-                                    PreviewImage(character, situation, url, thumbnail_ppm=thumbnail),
-                                )
-                                return
-                        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                            continue
+                        for outfit in probe.outfits:
+                            url = probe.make_url(character, candidate, outfit)
+                            try:
+                                response = await request_policy.get(session, url, allow_redirects=False)
+                                async with response:
+                                    if response.status == 404:
+                                        continue
+                                    if response.status != 200 or not response.content_type.startswith("image/"):
+                                        continue
+                                    data = await read_image_response(response)
+                                    if not SecurityGuard.has_safe_image_signature(data[:32]):
+                                        continue
+                                    thumbnail = await asyncio.to_thread(
+                                        encode_thumbnail_ppm, data, thumbnail_size
+                                    )
+                                    on_item(
+                                        character,
+                                        PreviewImage(character, situation, url, thumbnail_ppm=thumbnail),
+                                    )
+                                    return
+                            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                                continue
 
             if character_timeout and character_timeout > 0:
                 try:
@@ -1060,8 +1149,11 @@ class Downloader:
             ),
         )
         self.characters = config.expand_characters()
+        self.outfits = config.active_outfits()
         self.situations = config.expand_situations()
-        self.stats = DownloadStats(total=len(self.characters) * len(self.situations))
+        self.stats = DownloadStats(
+            total=len(self.characters) * len(self.outfits) * len(self.situations)
+        )
         self.defender = SecurityGuard.defender_executable() if config.scan_with_defender else None
 
     def scan_with_defender(self, path: Path) -> bool:
@@ -1075,10 +1167,12 @@ class Downloader:
         if result.returncode != 0:
             return False
         return "skipped" not in (result.stdout + result.stderr).lower()
-    def make_url(self, character: str, situation: str) -> str:
-        pose = f"{situation}{self.config.outfit}"
+
+    def make_url(self, character: str, situation: str, outfit: str | None = None) -> str:
+        outfit_code = outfit if outfit is not None else self.outfits[0]
+        pose = f"{situation}{outfit_code}"
         return self.config.template_url.format(
-            char=character, pose=pose, situation=situation, outfit=self.config.outfit
+            char=character, pose=pose, situation=situation, outfit=outfit_code
         )
 
     @staticmethod
@@ -1096,13 +1190,15 @@ class Downloader:
         semaphore: asyncio.Semaphore,
         character: str,
         situation: str,
+        outfit: str,
     ) -> Literal["success", "failed", "cancelled"]:
         if self.cancelled.is_set():
             return "cancelled"
-        extension = Path(urlparse(self.make_url(character, situation)).path).suffix or ".webp"
+        extension = Path(urlparse(self.make_url(character, situation, outfit)).path).suffix or ".webp"
         output_dir = self.config.destination / character if self.config.separate_character_folders else self.config.destination
         output_dir.mkdir(parents=True, exist_ok=True)
-        output = output_dir / f"{character}_{situation}{self.config.outfit}{extension}"
+        # Clear separators avoid ambiguous names like DNA_1A1 vs DNA_11A.
+        output = output_dir / f"{character}_{outfit}_{situation}{extension}"
         temp = output.with_name(f".{output.stem}.part{output.suffix}")
         temp.unlink(missing_ok=True)
         last_error: Exception | None = None
@@ -1110,7 +1206,7 @@ class Downloader:
         try:
             async with semaphore:
                 for candidate in self.situation_candidates(situation):
-                    url = self.make_url(character, candidate)
+                    url = self.make_url(character, candidate, outfit)
                     for attempt in range(1, self.config.retries + 1):
                         if self.cancelled.is_set():
                             return "cancelled"
@@ -1160,7 +1256,7 @@ class Downloader:
                                 await asyncio.sleep(0.35 * attempt)
             if self.cancelled.is_set():
                 return "cancelled"
-            self.notify("log", f"실패 [{character}/{situation}]: {last_error}")
+            self.notify("log", f"실패 [{character}/{outfit}/{situation}]: {last_error}")
             return "failed"
         finally:
             if not committed:
@@ -1181,15 +1277,16 @@ class Downloader:
         headers = make_request_headers(None)
         progress = Progress(SpinnerColumn(), TextColumn("다운로드"), BarColumn(), "{task.completed}/{task.total}", TimeRemainingColumn())
         worker_count = min(self.config.concurrency, max(1, self.stats.total))
-        work_queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue(maxsize=worker_count * 2)
+        work_queue: asyncio.Queue[tuple[str, str, str] | None] = asyncio.Queue(maxsize=worker_count * 2)
 
         async def produce() -> None:
             try:
                 for character in self.characters:
-                    for situation in self.situations:
-                        if self.cancelled.is_set():
-                            return
-                        await work_queue.put((character, situation))
+                    for outfit in self.outfits:
+                        for situation in self.situations:
+                            if self.cancelled.is_set():
+                                return
+                            await work_queue.put((character, situation, outfit))
             finally:
                 for _ in range(worker_count):
                     await work_queue.put(None)
@@ -1205,8 +1302,8 @@ class Downloader:
                 try:
                     if work is None:
                         return
-                    character, situation = work
-                    result = await self.download_one(session, semaphore, character, situation)
+                    character, situation, outfit = work
+                    result = await self.download_one(session, semaphore, character, situation, outfit)
                     match result:
                         case "success": self.stats.success += 1
                         case "failed": self.stats.failed += 1
@@ -1632,10 +1729,10 @@ class DownloaderApp(ctk.CTk):
         form = self._card(main)
         form.grid(row=1, column=0, sticky="ew")
         form.grid_columnconfigure((0, 1), weight=1)
-        self._entry(form, "템플릿 URL", "치환 토큰: 캐릭터 · 상황 · 의상", 0, 0, span=2)
-        self._entry(form, "캐릭터 코드", "쉼표로 구분 · A1..7 가능", 1, 0)
-        self._entry(form, "의상 코드", "공란 = X", 1, 1)
-        self._entry(form, "상황 코드 범위", "1, 01..50 또는 s01..83", 2, 0)
+        self._entry(form, "템플릿 URL", "치환 토큰: 캐릭터 · 의상 · 상황 · pose", 0, 0, span=2)
+        self._entry(form, "캐릭터 코드", "쉼표/범위 · a0..13,d0..9", 1, 0)
+        self._entry(form, "의상 코드", "쉼표/범위 · A1,E1..E4 공란=X", 1, 1)
+        self._entry(form, "상황 코드 범위", "쉼표/범위 · 1..50,s01..83", 2, 0)
         self._entry(form, "동시 다운로드", "공란 = 20", 2, 1)
         self._build_referer_row(form, row=3)
         preview_row = ctk.CTkFrame(form, fg_color="transparent")
@@ -2573,7 +2670,11 @@ class DownloaderApp(ctk.CTk):
         self.gallery_selected_character = character
         for name, button in self.gallery_tab_buttons.items():
             button.configure(fg_color=self.COLORS["accent"] if name == character else "#273450")
-        self.events.put(("live_preview_start", (sequence, character, len(self.preview_config.expand_situations()))))
+        preview_total = (
+            len(self.preview_config.expand_situations())
+            * len(self.preview_config.active_outfits())
+        )
+        self.events.put(("live_preview_start", (sequence, character, preview_total)))
         self._start_worker(
             self._live_preview_worker,
             args=(self.preview_config, character, sequence, self.preview_cancel_event, cache_dir),
@@ -3593,7 +3694,7 @@ class DownloaderApp(ctk.CTk):
         self.progress.set(0); self.log.delete("1.0", "end")
         self.start_button.configure(state="disabled"); self.preview_button.configure(state="disabled"); self.cancel_button.configure(state="normal")
         self.state_badge.configure(text="●  진행 중", fg_color="#293562", text_color="#B7C1FF")
-        self.status.configure(text=f"0 / {len(config.expand_characters()) * len(config.expand_situations())}개를 준비했습니다.")
+        self.status.configure(text=f"0 / {config.job_count()}개를 준비했습니다.")
         self._write_log("다운로드 큐를 시작했습니다.")
         self._start_worker(self._worker, args=(config,), name="download-batch")
 

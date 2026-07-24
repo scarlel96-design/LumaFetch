@@ -10,7 +10,7 @@ if %errorlevel%==0 (
 )
 
 echo ============================================================
-echo  Luma Fetch 1.13.2 - Windows Release Build
+echo  Luma Fetch 1.14.0 - Windows Release Build
 echo ============================================================
 "%POWERSHELL_EXE%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\build_windows.ps1"
 set "EXIT_CODE=%errorlevel%"
@@ -22,5 +22,5 @@ if not "%EXIT_CODE%"=="0" (
 )
 
 echo.
-echo Output: %~dp0outputs\LumaFetch-Setup-1.13.2.exe
+echo Output: %~dp0outputs\LumaFetch-Setup-1.14.0.exe
 exit /b 0

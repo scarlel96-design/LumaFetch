@@ -332,3 +332,70 @@ def test_legacy_favorite_without_referer_opens_as_auto() -> None:
         }
     )
     assert restored.referer_mode == "auto"
+
+
+def test_auto_referer_retries_after_401() -> None:
+    async def scenario() -> None:
+        app = web.Application()
+        hits: list[str | None] = []
+
+        async def handler(request: web.Request) -> web.StreamResponse:
+            referer = request.headers.get("Referer")
+            hits.append(referer)
+            if referer == "https://babechat.ai/":
+                return web.Response(body=PNG_1X1, content_type="image/png")
+            return web.Response(status=401, text="auth")
+
+        app.router.add_get("/img", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            policy = ImageRequestPolicy(None, auto_candidates=("https://babechat.ai/",))
+            async with ClientSession(headers=make_request_headers(None)) as session:
+                response = await policy.get(session, f"http://127.0.0.1:{port}/img")
+                async with response:
+                    assert response.status == 200
+            assert hits[0] is None
+            assert "https://babechat.ai/" in hits
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_auto_referer_prefers_image_200_over_404() -> None:
+    async def scenario() -> None:
+        app = web.Application()
+
+        async def handler(request: web.Request) -> web.StreamResponse:
+            referer = request.headers.get("Referer")
+            if referer == "https://elyn.ai/":
+                return web.Response(body=PNG_1X1, content_type="image/png")
+            if referer == "https://babechat.ai/":
+                return web.Response(status=404, text="missing")
+            return web.Response(status=403, text="blocked")
+
+        app.router.add_get("/img", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            policy = ImageRequestPolicy(
+                None,
+                auto_candidates=("https://babechat.ai/", "https://elyn.ai/"),
+            )
+            async with ClientSession(headers=make_request_headers(None)) as session:
+                response = await policy.get(session, f"http://127.0.0.1:{port}/img")
+                async with response:
+                    assert response.status == 200
+                    assert await response.read() == PNG_1X1
+            assert policy._resolved["127.0.0.1"] == "https://elyn.ai/"
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(scenario())

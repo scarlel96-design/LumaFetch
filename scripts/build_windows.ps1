@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $ProgressPreference = "SilentlyContinue"
 
-$ExpectedVersion = "1.13.2"
+$ExpectedVersion = "1.14.0"
 $ExpectedInstaller = "LumaFetch-Setup-$ExpectedVersion.exe"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
@@ -137,10 +137,10 @@ if (-not $SkipBootstrap) {
 
 Write-Step "버전 계약 확인"
 $releaseContractFiles = @(
-    @{ Path = "app.py"; Pattern = 'APP_VERSION = "1\.13\.2"' },
-    @{ Path = "lumafetch\__init__.py"; Pattern = '__version__ = "1\.13\.2"' },
-    @{ Path = "installer\LumaFetch.iss"; Pattern = '#define MyAppVersion "1\.13\.2"' },
-    @{ Path = "installer\LumaFetch.iss"; Pattern = 'OutputBaseFilename=LumaFetch-Setup-1\.13\.2' }
+    @{ Path = "app.py"; Pattern = 'APP_VERSION = "1\.14\.0"' },
+    @{ Path = "lumafetch\__init__.py"; Pattern = '__version__ = "1\.14\.0"' },
+    @{ Path = "installer\LumaFetch.iss"; Pattern = '#define MyAppVersion "1\.14\.0"' },
+    @{ Path = "installer\LumaFetch.iss"; Pattern = 'OutputBaseFilename=LumaFetch-Setup-1\.14\.0' }
 )
 foreach ($contract in $releaseContractFiles) {
     $content = Get-Content (Join-Path $root $contract.Path) -Raw -Encoding UTF8
@@ -172,7 +172,7 @@ if ($LASTEXITCODE -ne 0) { throw "PyInstaller 빌드가 실패했습니다." }
 $appExe = Join-Path $root "work\dist\LumaFetch\LumaFetch.exe"
 Assert-File $appExe "LumaFetch 실행"
 $appVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($appExe)
-if ($appVersion.FileVersion -notlike "1.13.2*") {
+if ($appVersion.FileVersion -notlike "1.14.0*") {
     throw "LumaFetch.exe 파일 버전이 올바르지 않습니다: $($appVersion.FileVersion)"
 }
 
@@ -196,7 +196,7 @@ if ($installerInfo.Length -lt 1MB) {
     throw "설치 파일 크기가 비정상적으로 작습니다: $($installerInfo.Length) bytes"
 }
 $installerVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($installer)
-if ($installerVersion.FileVersion -notlike "1.13.2*") {
+if ($installerVersion.FileVersion -notlike "1.14.0*") {
     throw "설치 파일 버전이 올바르지 않습니다: $($installerVersion.FileVersion)"
 }
 
