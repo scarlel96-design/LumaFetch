@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.13.1 — 2026-07-24
+
+### Changed
+
+- Referer now has **자동 / 수동** modes next to the field, styled like existing secondary CTkButtons (accent when selected, #273450 when idle).
+- Auto mode requests images normally, then on HTTP 403 quickly probes built-in platform Referers in parallel and caches the first match per host.
+- Built-in auto platforms: BabeChat, Crack, Elyn, CAVEDUCK, EdenChat, LUNATALK, Teapot, ChuuChat, BoriChat.
+- Manual mode uses the address typed in the Referer field.
+- Favorites store the Referer mode; older favorites with a saved Referer open in manual mode.
+
 ## 1.13.0 — 2026-07-22
 
 ### Build handoff

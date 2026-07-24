@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - agent/lumafetch-1.13.0
+      - agent/lumafetch-1.13.1
   pull_request:
     paths:
       - "**/*.py"
@@ -41,7 +41,7 @@ jobs:
       - name: Verify release outputs
         shell: pwsh
         run: |
-          $path = "outputs\LumaFetch-Setup-1.13.0.exe"
+          $path = "outputs\LumaFetch-Setup-1.13.1.exe"
           if (-not (Test-Path $path)) { throw "Missing installer: $path" }
           if ((Get-Item $path).Length -lt 1MB) { throw "Installer is unexpectedly small" }
           Get-Content "outputs\BUILD_INFO.txt"
@@ -49,9 +49,9 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: LumaFetch-Setup-1.13.0
+          name: LumaFetch-Setup-1.13.1
           path: |
-            outputs/LumaFetch-Setup-1.13.0.exe
+            outputs/LumaFetch-Setup-1.13.1.exe
             outputs/SHA256SUMS.txt
             outputs/BUILD_INFO.txt
           if-no-files-found: error

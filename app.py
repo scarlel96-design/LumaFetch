@@ -36,7 +36,7 @@ from lumafetch.runtime import PreviewCacheManager, UiEventBus, WorkerRegistry
 from lumafetch.storage import atomic_write_json, cleanup_stale_part_files, load_validated_json_list
 
 
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.13.1"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
@@ -74,7 +74,20 @@ IMAGE_BROWSER_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
 )
-AUTO_REFERER_CANDIDATES = ("https://si-ran.com/",)
+# Built-in chat platforms used for silent 403 Referer auto-discovery.
+AUTO_REFERER_PLATFORMS: tuple[tuple[str, str], ...] = (
+    ("BabeChat", "https://babechat.ai/"),
+    ("Crack", "https://crack.wrtn.ai/"),
+    ("Elyn", "https://elyn.ai/"),
+    ("CAVEDUCK", "https://caveduck.io/"),
+    ("EdenChat", "https://eden-chat.com/"),
+    ("LUNATALK", "https://lunatalk.chat/"),
+    ("Teapot", "https://teapotchat.com/"),
+    ("ChuuChat", "https://chuu.ai/"),
+    ("BoriChat", "https://bori.chat/"),
+)
+AUTO_REFERER_CANDIDATES: tuple[str, ...] = tuple(url for _name, url in AUTO_REFERER_PLATFORMS)
+REFERER_PLATFORM_BY_URL: dict[str, str] = {url: name for name, url in AUTO_REFERER_PLATFORMS}
 
 
 def make_request_headers(referer: str | None) -> dict[str, str]:
@@ -93,22 +106,50 @@ def make_request_headers(referer: str | None) -> dict[str, str]:
     return headers
 
 
+def platform_label_for_referer(referer: str | None) -> str:
+    """Human-readable platform name for logs/UI; falls back to host."""
+    if not referer:
+        return "없음"
+    if name := REFERER_PLATFORM_BY_URL.get(referer):
+        return name
+    return urlparse(referer).netloc or referer
+
+
 class ImageRequestPolicy:
-    """Resolve a hotlink Referer once per host, then reuse it for the batch."""
+    """Resolve a hotlink Referer once per host, then reuse it for the batch.
+
+    Auto mode (explicit_referer is None):
+      1. Request normally without Referer.
+      2. On HTTP 403, probe built-in platform Referers in parallel.
+      3. Cache the first working platform for that host and reuse it.
+    Manual mode: always send the user-provided Referer.
+    """
 
     def __init__(
         self,
         explicit_referer: str | None,
         on_detected: Callable[[str, str], None] | None = None,
+        *,
+        auto_candidates: tuple[str, ...] | None = None,
     ) -> None:
         self.explicit_referer = explicit_referer
         self.on_detected = on_detected
+        self.auto_candidates = auto_candidates if auto_candidates is not None else AUTO_REFERER_CANDIDATES
         self._resolved: dict[str, str | None] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
     @staticmethod
     def _referer_headers(referer: str | None) -> dict[str, str] | None:
         return {"Referer": referer} if referer else None
+
+    @staticmethod
+    def _safe_release(response: aiohttp.ClientResponse | None) -> None:
+        if response is None:
+            return
+        try:
+            response.release()
+        except Exception:
+            pass
 
     async def get(
         self,
@@ -140,25 +181,53 @@ class ImageRequestPolicy:
                     **kwargs,
                 )
 
-            candidates: tuple[str | None, ...] = (None, *AUTO_REFERER_CANDIDATES)
-            saw_forbidden = False
-            for index, referer in enumerate(candidates):
-                response = await session.get(
-                    url,
-                    headers=self._referer_headers(referer),
-                    **kwargs,
-                )
-                if response.status == 403 and index < len(candidates) - 1:
-                    saw_forbidden = True
-                    response.release()
+            bare = await session.get(url, headers=self._referer_headers(None), **kwargs)
+            if bare.status != 403 or not self.auto_candidates:
+                self._resolved[host] = None
+                return bare
+            self._safe_release(bare)
+
+            async def probe(referer: str) -> tuple[str, aiohttp.ClientResponse | BaseException]:
+                try:
+                    response = await session.get(
+                        url,
+                        headers=self._referer_headers(referer),
+                        **kwargs,
+                    )
+                    return referer, response
+                except BaseException as error:  # noqa: BLE001 - collect per-candidate failures
+                    return referer, error
+
+            # Parallel compare-and-assign so multi-platform discovery stays snappy.
+            probed = await asyncio.gather(*(probe(referer) for referer in self.auto_candidates))
+            chosen_referer: str | None = None
+            chosen_response: aiohttp.ClientResponse | None = None
+            fallback_forbidden: aiohttp.ClientResponse | None = None
+
+            for referer, result in probed:
+                if isinstance(result, BaseException):
                     continue
+                if chosen_response is None and result.status != 403:
+                    chosen_referer = referer
+                    chosen_response = result
+                    continue
+                if fallback_forbidden is None and result.status == 403:
+                    fallback_forbidden = result
+                    continue
+                self._safe_release(result)
 
-                self._resolved[host] = referer
-                if saw_forbidden and referer and response.status != 403 and self.on_detected:
-                    self.on_detected(host, referer)
-                return response
+            if chosen_response is not None:
+                self._safe_release(fallback_forbidden)
+                self._resolved[host] = chosen_referer
+                if chosen_referer and self.on_detected:
+                    self.on_detected(host, chosen_referer)
+                return chosen_response
 
-        raise RuntimeError("이미지 요청 정책이 응답을 선택하지 못했습니다.")
+            # Every candidate stayed forbidden or failed — cache empty so we do not re-scan.
+            self._resolved[host] = None
+            if fallback_forbidden is not None:
+                return fallback_forbidden
+            return await session.get(url, headers=self._referer_headers(None), **kwargs)
 
 
 class SecurityGuard:
@@ -233,6 +302,7 @@ class DownloadConfig(BaseModel):
     destination: Path
     separate_character_folders: bool = False
     scan_with_defender: bool = False
+    referer_mode: Literal["auto", "manual"] = "auto"
     referer: str | None = None
     concurrency: int = Field(default=20, ge=1, le=50)
     retries: int = Field(default=3, ge=1, le=5)
@@ -242,6 +312,18 @@ class DownloadConfig(BaseModel):
     def valid_template_url(cls, value: str) -> str:
         return SecurityGuard.validate_url(normalize_template_url(value.strip()), template=True)
 
+    @field_validator("referer_mode", mode="before")
+    @classmethod
+    def normalize_referer_mode(cls, value: object) -> str:
+        if value is None or value == "":
+            return "auto"
+        text = str(value).strip().casefold()
+        if text in {"auto", "자동"}:
+            return "auto"
+        if text in {"manual", "수동"}:
+            return "manual"
+        raise ValueError("Referer 모드는 자동 또는 수동만 선택할 수 있습니다.")
+
     @field_validator("referer")
     @classmethod
     def valid_referer(cls, value: str | None) -> str | None:
@@ -250,6 +332,10 @@ class DownloadConfig(BaseModel):
         if "://" not in referer:
             referer = f"https://{referer}"
         return SecurityGuard.validate_url(referer)
+
+    def explicit_referer(self) -> str | None:
+        """Manual mode uses the typed Referer; auto mode discovers platforms on 403."""
+        return self.referer if self.referer_mode == "manual" else None
 
     @field_validator("character")
     @classmethod
@@ -320,6 +406,7 @@ class FavoritePreset(BaseModel):
     character: str
     ranges: str
     outfit: str = "X"
+    referer_mode: Literal["auto", "manual"] = "auto"
     referer: str | None = None
     concurrency: int = Field(default=20, ge=1, le=50)
     separate_character_folders: bool = False
@@ -334,6 +421,16 @@ class FavoritePreset(BaseModel):
             raise ValueError("즐겨찾기 이름을 입력하세요.")
         return name
 
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_referer_mode(cls, data: object) -> object:
+        """Old favorites only stored referer text — treat non-empty as manual."""
+        if not isinstance(data, dict) or "referer_mode" in data:
+            return data
+        payload = dict(data)
+        payload["referer_mode"] = "manual" if payload.get("referer") else "auto"
+        return payload
+
     @model_validator(mode="after")
     def validate_snapshot(self) -> FavoritePreset:
         DownloadConfig(
@@ -341,6 +438,7 @@ class FavoritePreset(BaseModel):
             character=self.character,
             ranges=self.ranges,
             outfit=self.outfit,
+            referer_mode=self.referer_mode,
             referer=self.referer,
             concurrency=self.concurrency,
             destination=Path(self.destination or Path.cwd()),
@@ -638,7 +736,7 @@ async def fetch_live_previews(
     )
     timeout = aiohttp.ClientTimeout(total=25, connect=10, sock_read=18)
     headers = make_request_headers(None)
-    request_policy = ImageRequestPolicy(config.referer)
+    request_policy = ImageRequestPolicy(config.explicit_referer())
     next_index = 0
     index_lock = asyncio.Lock()
     success = 0
@@ -777,7 +875,7 @@ async def fetch_preview_covers(
     connector = aiohttp.TCPConnector(limit=4, limit_per_host=4, ttl_dns_cache=300, resolver=PublicResolver())
     timeout = aiohttp.ClientTimeout(total=20, connect=8, sock_read=15)
     headers = make_request_headers(None)
-    request_policy = ImageRequestPolicy(config.referer)
+    request_policy = ImageRequestPolicy(config.explicit_referer())
 
     async def one(session: aiohttp.ClientSession, character: str) -> None:
         async with semaphore:
@@ -809,10 +907,10 @@ class Downloader:
         self.cancelled = cancelled
         self.notify = notify
         self.request_policy = ImageRequestPolicy(
-            config.referer,
+            config.explicit_referer(),
             lambda host, referer: self.notify(
                 "log",
-                f"403 자동 대응 · {host} 요청에 Referer {referer} 적용",
+                f"Referer 자동 연결 · {host} → {platform_label_for_referer(referer)}",
             ),
         )
         self.characters = config.expand_characters()
@@ -1346,7 +1444,7 @@ class DownloaderApp(ctk.CTk):
         self._entry(form, "의상 코드", "공란 = X", 1, 1)
         self._entry(form, "상황 코드 범위", "1, 01..50 또는 s01..83", 2, 0)
         self._entry(form, "동시 다운로드", "공란 = 20", 2, 1)
-        self._entry(form, "Referer", "필요 시 원본 페이지 주소", 3, 0, span=2)
+        self._build_referer_row(form, row=3)
         preview_row = ctk.CTkFrame(form, fg_color="transparent")
         preview_row.grid(row=4, column=0, columnspan=2, padx=18, pady=(4, 2), sticky="ew")
         preview_row.grid_columnconfigure(0, weight=1)
@@ -1366,7 +1464,8 @@ class DownloaderApp(ctk.CTk):
         self.preview.grid(row=0, column=0, sticky="ew")
         input_help = (
             "캐릭터 코드는 A1..7 또는 쉼표(,)로 구분하고, 상황 코드는 1, 01..50, s01..83 형식으로 입력하세요.\n"
-            "템플릿 URL에서 코드가 들어갈 위치는 캐릭터 · 의상 · 상황 키워드로 채우세요."
+            "템플릿 URL에서 코드가 들어갈 위치는 캐릭터 · 의상 · 상황 키워드로 채우세요.\n"
+            "Referer 자동 모드는 평소 일반 요청으로 받고, 403이 나면 내장 플랫폼 목록을 빠르게 대조해 연결합니다."
         )
         ctk.CTkLabel(
             form,
@@ -1711,6 +1810,113 @@ class DownloaderApp(ctk.CTk):
         self.entry_vars[label] = variable
         variable.trace_add("write", lambda *_args: self._trace_preview_update())
 
+    def _build_referer_row(self, parent: ctk.CTkFrame, *, row: int) -> None:
+        """Referer field with auto/manual toggles matching secondary CTkButton styling."""
+        holder = ctk.CTkFrame(parent, fg_color="transparent")
+        holder.grid(row=row, column=0, columnspan=2, padx=18, pady=(3, 3), sticky="ew")
+        holder.grid_columnconfigure(0, weight=1)
+        header = ctk.CTkFrame(holder, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 3))
+        header.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(header, text="Referer", font=self._font(11, "bold"), text_color="#DDE5FF").grid(
+            row=0, column=0, sticky="w"
+        )
+        mode_bar = ctk.CTkFrame(header, fg_color="transparent")
+        mode_bar.grid(row=0, column=1, sticky="e")
+        self.referer_mode_var = ctk.StringVar(value="auto")
+        # Same palette as 미리보기/즐겨찾기 secondary buttons + selected nav accent.
+        button_kwargs = {
+            "width": 58,
+            "height": 28,
+            "corner_radius": 11,
+            "font": self._font(10, "bold"),
+            "text_color": self.COLORS["text"],
+        }
+        self.referer_auto_button = ctk.CTkButton(
+            mode_bar,
+            text="자동",
+            command=lambda: self._on_referer_mode_change("auto"),
+            **button_kwargs,
+        )
+        self.referer_auto_button.pack(side="left", padx=(0, 6))
+        self.referer_manual_button = ctk.CTkButton(
+            mode_bar,
+            text="수동",
+            command=lambda: self._on_referer_mode_change("manual"),
+            **button_kwargs,
+        )
+        self.referer_manual_button.pack(side="left")
+        variable = ctk.StringVar(value="")
+        entry = ctk.CTkEntry(
+            holder,
+            textvariable=variable,
+            placeholder_text="403 시 내장 플랫폼 자동 탐색",
+            height=34,
+            corner_radius=11,
+            fg_color=self.COLORS["input"],
+            border_color="#2A3655",
+            font=self._font(11),
+            text_color=self.COLORS["text"],
+        )
+        entry.grid(row=1, column=0, sticky="ew")
+        entry.bind("<KeyRelease>", self._queue_preview_update)
+        entry.bind("<FocusOut>", self._queue_preview_update)
+        self.entries["Referer"] = entry
+        self.entry_vars["Referer"] = variable
+        variable.trace_add("write", lambda *_args: self._trace_preview_update())
+        self._sync_referer_mode_ui()
+
+    def _referer_mode_value(self) -> Literal["auto", "manual"]:
+        return "manual" if self.referer_mode_var.get() == "manual" else "auto"
+
+    def _set_referer_mode(self, mode: Literal["auto", "manual"]) -> None:
+        self.referer_mode_var.set(mode)
+        self._sync_referer_mode_ui()
+
+    def _on_referer_mode_change(self, mode: Literal["auto", "manual"]) -> None:
+        if self.referer_mode_var.get() == mode:
+            self._sync_referer_mode_ui()
+            return
+        self.referer_mode_var.set(mode)
+        self._sync_referer_mode_ui()
+        if not self.preview_updates_suspended:
+            self._trace_preview_update()
+
+    def _sync_referer_mode_ui(self) -> None:
+        """Paint auto/manual toggles like the rest of the app and gate the entry field."""
+        mode = self._referer_mode_value()
+        selected = {
+            "fg_color": self.COLORS["accent"],
+            "hover_color": self.COLORS["accent_hover"],
+        }
+        idle = {
+            "fg_color": "#273450",
+            "hover_color": "#334364",
+        }
+        if hasattr(self, "referer_auto_button"):
+            self.referer_auto_button.configure(**(selected if mode == "auto" else idle))
+            self.referer_manual_button.configure(**(selected if mode == "manual" else idle))
+        entry = self.entries.get("Referer")
+        if entry is None:
+            return
+        if mode == "auto":
+            entry.configure(
+                state="disabled",
+                placeholder_text="403 시 내장 플랫폼 자동 탐색",
+            )
+        else:
+            entry.configure(
+                state="normal",
+                placeholder_text="원본 플랫폼 페이지 주소 (예: https://example.com/)",
+            )
+
+    def _current_referer_settings(self) -> tuple[Literal["auto", "manual"], str | None]:
+        mode = self._referer_mode_value()
+        raw = self.entries["Referer"].get().strip() or None
+        if mode == "manual":
+            return mode, raw
+        return mode, None
+
     def _trace_preview_update(self) -> None:
         """Ignore programmatic favorite loads while preserving normal live validation."""
         if not self.preview_updates_suspended:
@@ -1744,12 +1950,14 @@ class DownloaderApp(ctk.CTk):
 
     def _preview_config(self) -> DownloadConfig:
         """Validate preview inputs without requiring a download destination."""
+        referer_mode, referer = self._current_referer_settings()
         return DownloadConfig(
             template_url=self.entries["템플릿 URL"].get(),
             character=self.entries["캐릭터 코드"].get(),
             ranges=self.entries["상황 코드 범위"].get(),
             outfit=self.entries["의상 코드"].get(),
-            referer=self.entries["Referer"].get().strip() or None,
+            referer_mode=referer_mode,
+            referer=referer,
             concurrency=1,
             destination=Path.cwd(),
         )
@@ -1771,7 +1979,9 @@ class DownloaderApp(ctk.CTk):
             label = {
                 "template_url": "템플릿 URL", "character": "캐릭터 코드",
                 "ranges": "상황 코드 범위", "outfit": "의상 코드",
-                "referer": "Referer", "concurrency": "동시 다운로드",
+                "referer": "Referer",
+                "referer_mode": "Referer 모드",
+                "concurrency": "동시 다운로드",
                 "destination": "저장 위치",
             }.get(field, "입력값")
             message = str(issue.get("msg", error)).removeprefix("Value error, ")
@@ -1833,11 +2043,12 @@ class DownloaderApp(ctk.CTk):
             args=(config, sequence, self.preview_cancel_event),
             name=f"preview-cover-{sequence}",
         )
-        referer_state = (
-            f"Referer 적용: {urlparse(config.referer).netloc}"
-            if config.referer
-            else "Referer 자동 감지(403 대응)"
-        )
+        if config.referer_mode == "manual" and config.referer:
+            referer_state = f"Referer 수동: {urlparse(config.referer).netloc}"
+        elif config.referer_mode == "manual":
+            referer_state = "Referer 수동(미입력)"
+        else:
+            referer_state = "Referer 자동(403 시 플랫폼 탐색)"
         self.preview.configure(text=f"캐릭터를 선택하면 전체 이미지를 불러옵니다. · {referer_state}")
 
     def _ensure_preview_gallery(self) -> None:
@@ -2333,7 +2544,7 @@ class DownloaderApp(ctk.CTk):
             favorite for favorite in self.favorites
             if not query or query in " ".join((
                 favorite.name, favorite.template_url, favorite.character,
-                favorite.ranges, favorite.referer or "",
+                favorite.ranges, favorite.referer_mode, favorite.referer or "",
             )).casefold()
         ]
         page_count = max(1, (len(filtered) + FAVORITES_PAGE_SIZE - 1) // FAVORITES_PAGE_SIZE)
@@ -2382,8 +2593,13 @@ class DownloaderApp(ctk.CTk):
         }
         self.preview_updates_suspended = True
         try:
+            self._set_referer_mode(favorite.referer_mode)
+            # Enable the entry before writing so disabled-state values are not dropped.
+            if favorite.referer_mode == "manual":
+                self.entries["Referer"].configure(state="normal")
             for label, value in values.items():
                 self.entry_vars[label].set(value)
+            self._sync_referer_mode_ui()
             self.separate_folders_var.set(favorite.separate_character_folders)
             self.defender_scan_var.set(favorite.scan_with_defender)
             self.fixed_destination_var.set(favorite.fixed_destination)
@@ -2434,7 +2650,8 @@ class DownloaderApp(ctk.CTk):
                 character=config.character,
                 ranges=config.ranges,
                 outfit=config.outfit,
-                referer=config.referer,
+                referer_mode=config.referer_mode,
+                referer=config.referer if config.referer_mode == "manual" else None,
                 concurrency=concurrency,
                 separate_character_folders=self.separate_folders_var.get(),
                 scan_with_defender=self.defender_scan_var.get(),
@@ -2517,12 +2734,14 @@ class DownloaderApp(ctk.CTk):
         folder = self.folder_var.get().strip()
         if not folder:
             raise ValueError("저장 폴더를 선택하세요.")
+        referer_mode, referer = self._current_referer_settings()
         return DownloadConfig(
             template_url=self.entries["템플릿 URL"].get(),
             character=self.entries["캐릭터 코드"].get(),
             ranges=self.entries["상황 코드 범위"].get(),
             outfit=self.entries["의상 코드"].get(),
-            referer=self.entries["Referer"].get().strip() or None,
+            referer_mode=referer_mode,
+            referer=referer,
             concurrency=int(self.entries["동시 다운로드"].get().strip() or 20),
             destination=Path(folder).expanduser(),
             separate_character_folders=self.separate_folders_var.get(),

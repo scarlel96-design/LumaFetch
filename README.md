@@ -11,7 +11,8 @@ Luma Fetch is a Windows desktop batch downloader for image URLs that follow a pr
 - Original-image viewer with fit/fill/100% modes, wheel zoom, drag panning, fullscreen, and navigation
 - Split network/decode pipeline, non-blocking UI event bus, disk-backed preview cache, and lifecycle-safe cleanup
 - Named favorites that restore every input; damaged entries are skipped individually without hiding valid favorites
-- Optional Referer handling, character subfolders, retries, cancellation, Microsoft Defender scanning, and update verification
+- Referer auto/manual modes: auto silently discovers built-in chat platforms on HTTP 403; manual uses a typed origin URL
+- Optional character subfolders, retries, cancellation, Microsoft Defender scanning, and update verification
 - Automatic cleanup of stale `.part` files after interrupted downloads
 
 ## Run from source
@@ -60,7 +61,7 @@ The command creates an isolated build environment, installs required build packa
 Generated files:
 
 ```text
-outputs\LumaFetch-Setup-1.13.0.exe
+outputs\LumaFetch-Setup-1.13.1.exe
 outputs\SHA256SUMS.txt
 outputs\BUILD_INFO.txt
 ```
