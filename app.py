@@ -36,15 +36,23 @@ from lumafetch.runtime import PreviewCacheManager, UiEventBus, WorkerRegistry
 from lumafetch.storage import atomic_write_json, cleanup_stale_part_files, load_validated_json_list
 
 
-APP_VERSION = "1.13.1"
+APP_VERSION = "1.13.2"
 GITHUB_REPOSITORY = "scarlel96-design/LumaFetch"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
+RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases"
 RELEASES_URL_PREFIX = f"https://github.com/{GITHUB_REPOSITORY}/releases/"
 MAX_RELEASE_METADATA_BYTES = 256 * 1024
+MAX_RELEASE_CATALOG_BYTES = 1_500_000
 MAX_UPDATE_INSTALLER_BYTES = 150 * 1024 * 1024
+MAX_RELEASE_CATALOG_ITEMS = 40
 FAVORITES_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LumaFetch" / "favorites.json"
 MAX_FAVORITES = 1000
-FAVORITES_PAGE_SIZE = 30
+FAVORITES_PAGE_SIZE = 20
+FAVORITE_CARD_BATCH_SIZE = 6
+FAVORITE_COVER_LIMIT = 4
+FAVORITE_COVER_SITUATION_PROBES = 8
+FAVORITE_COVER_SIZE = (72, 64)
+FAVORITE_COVER_CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LumaFetch" / "favorite_covers"
 MAX_CHARACTER_CODES = 1000
 MAX_CHARACTER_CODE_LENGTH = 120
 MAX_CHARACTER_LIST_LENGTH = 131_072
@@ -487,11 +495,68 @@ class UpdateInfo:
     asset_url: str
     asset_size: int
     asset_sha256: str
+    published_at: str = ""
+    is_prerelease: bool = False
 
 
 def parse_release_version(value: str) -> tuple[int, int, int] | None:
     match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value.strip())
     return tuple(map(int, match.groups())) if match else None
+
+
+def format_version_tuple(version: tuple[int, int, int]) -> str:
+    return ".".join(map(str, version))
+
+
+def parse_github_release(payload: object) -> UpdateInfo | None:
+    """Parse one GitHub release payload into a trusted installer update record."""
+    if not isinstance(payload, dict) or payload.get("draft"):
+        return None
+    tag_name = str(payload.get("tag_name") or "")
+    version = parse_release_version(tag_name)
+    release_url = str(payload.get("html_url") or "")
+    if version is None or not is_trusted_release_url(release_url):
+        return None
+    expected_asset_name = f"LumaFetch-Setup-{format_version_tuple(version)}.exe"
+    assets = payload.get("assets")
+    asset = next(
+        (
+            item for item in assets
+            if isinstance(item, dict)
+            and item.get("state") == "uploaded"
+            and item.get("name") == expected_asset_name
+        ),
+        None,
+    ) if isinstance(assets, list) else None
+    if asset is None:
+        return None
+    asset_url = str(asset.get("browser_download_url") or "")
+    digest = str(asset.get("digest") or "")
+    digest_match = re.fullmatch(r"sha256:([0-9a-fA-F]{64})", digest)
+    try:
+        asset_size = int(asset.get("size") or 0)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not is_trusted_asset_url(asset_url)
+        or digest_match is None
+        or not 0 < asset_size <= MAX_UPDATE_INSTALLER_BYTES
+    ):
+        return None
+    published_at = str(payload.get("published_at") or payload.get("created_at") or "")
+    return UpdateInfo(
+        tag_name=tag_name,
+        version=version,
+        title=str(payload.get("name") or tag_name),
+        notes=str(payload.get("body") or "").strip()[:1200],
+        release_url=release_url,
+        asset_name=expected_asset_name,
+        asset_url=asset_url,
+        asset_size=asset_size,
+        asset_sha256=digest_match.group(1).lower(),
+        published_at=published_at,
+        is_prerelease=bool(payload.get("prerelease")),
+    )
 
 
 def is_trusted_release_url(value: str) -> bool:
@@ -539,16 +604,16 @@ def build_update_installer_command(installer: Path, *, restart: bool) -> list[st
     return command
 
 
-async def fetch_latest_release() -> UpdateInfo:
+async def _read_github_json(url: str, *, max_bytes: int) -> object:
     connector = aiohttp.TCPConnector(limit=2, ttl_dns_cache=300, resolver=PublicResolver())
-    timeout = aiohttp.ClientTimeout(total=15, connect=7, sock_read=10)
+    timeout = aiohttp.ClientTimeout(total=20, connect=7, sock_read=15)
     headers = {
         "User-Agent": f"LumaFetch/{APP_VERSION}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
-        async with session.get(LATEST_RELEASE_API, allow_redirects=False) as response:
+        async with session.get(url, allow_redirects=False) as response:
             if response.status == 404:
                 raise RuntimeError("아직 공개된 GitHub 릴리스가 없습니다.")
             if response.status == 403:
@@ -558,56 +623,41 @@ async def fetch_latest_release() -> UpdateInfo:
             raw = bytearray()
             async for chunk in response.content.iter_chunked(32 * 1024):
                 raw.extend(chunk)
-                if len(raw) > MAX_RELEASE_METADATA_BYTES:
+                if len(raw) > max_bytes:
                     raise RuntimeError("릴리스 정보가 허용 크기를 초과했습니다.")
     try:
-        payload = json.loads(raw)
+        return json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RuntimeError("GitHub 릴리스 응답을 해석할 수 없습니다.") from error
-    if not isinstance(payload, dict):
-        raise RuntimeError("GitHub 릴리스 응답 형식이 올바르지 않습니다.")
-    tag_name = str(payload.get("tag_name") or "")
-    version = parse_release_version(tag_name)
-    release_url = str(payload.get("html_url") or "")
-    if version is None or not is_trusted_release_url(release_url):
-        raise RuntimeError("GitHub 릴리스의 버전 또는 주소가 올바르지 않습니다.")
-    expected_asset_name = f"LumaFetch-Setup-{'.'.join(map(str, version))}.exe"
-    assets = payload.get("assets")
-    asset = next(
-        (
-            item for item in assets
-            if isinstance(item, dict)
-            and item.get("state") == "uploaded"
-            and item.get("name") == expected_asset_name
-        ),
-        None,
-    ) if isinstance(assets, list) else None
-    if asset is None:
-        raise RuntimeError(f"릴리스에서 {expected_asset_name} 설치 파일을 찾을 수 없습니다.")
-    asset_url = str(asset.get("browser_download_url") or "")
-    digest = str(asset.get("digest") or "")
-    digest_match = re.fullmatch(r"sha256:([0-9a-fA-F]{64})", digest)
-    try:
-        asset_size = int(asset.get("size") or 0)
-    except (TypeError, ValueError) as error:
-        raise RuntimeError("릴리스 설치 파일 크기가 올바르지 않습니다.") from error
-    if (
-        not is_trusted_asset_url(asset_url)
-        or digest_match is None
-        or not 0 < asset_size <= MAX_UPDATE_INSTALLER_BYTES
-    ):
-        raise RuntimeError("릴리스 설치 파일의 주소·크기·SHA-256 정보가 올바르지 않습니다.")
-    return UpdateInfo(
-        tag_name=tag_name,
-        version=version,
-        title=str(payload.get("name") or tag_name),
-        notes=str(payload.get("body") or "").strip()[:1200],
-        release_url=release_url,
-        asset_name=expected_asset_name,
-        asset_url=asset_url,
-        asset_size=asset_size,
-        asset_sha256=digest_match.group(1).lower(),
+
+
+async def fetch_latest_release() -> UpdateInfo:
+    payload = await _read_github_json(LATEST_RELEASE_API, max_bytes=MAX_RELEASE_METADATA_BYTES)
+    info = parse_github_release(payload)
+    if info is None:
+        raise RuntimeError("GitHub 최신 릴리스의 설치 파일을 해석할 수 없습니다.")
+    return info
+
+
+async def fetch_release_catalog(limit: int = MAX_RELEASE_CATALOG_ITEMS) -> list[UpdateInfo]:
+    """Fetch published releases (newest first) that include a verified installer asset."""
+    page_size = max(1, min(limit, 100))
+    payload = await _read_github_json(
+        f"{RELEASES_API}?per_page={page_size}",
+        max_bytes=MAX_RELEASE_CATALOG_BYTES,
     )
+    if not isinstance(payload, list):
+        raise RuntimeError("GitHub 릴리스 목록 형식이 올바르지 않습니다.")
+    releases: list[UpdateInfo] = []
+    for item in payload:
+        info = parse_github_release(item)
+        if info is not None:
+            releases.append(info)
+        if len(releases) >= limit:
+            break
+    if not releases:
+        raise RuntimeError("설치 파일이 포함된 공개 릴리스를 찾지 못했습니다.")
+    return releases
 
 
 async def download_update_installer(
@@ -867,9 +917,20 @@ async def fetch_preview_covers(
     config: DownloadConfig,
     on_item: Callable[[str, PreviewImage], None],
     cancelled: threading.Event,
+    *,
+    max_characters: int | None = None,
+    max_situation_probes: int | None = None,
+    thumbnail_size: tuple[int, int] = (132, 118),
 ) -> None:
     """Find the first existing image for each character selector card."""
+    characters = config.expand_characters()
+    if max_characters is not None:
+        characters = characters[: max(0, max_characters)]
     situations = config.expand_situations()
+    if max_situation_probes is not None:
+        situations = situations[: max(0, max_situation_probes)]
+    if not characters or not situations:
+        return
     probe = Downloader(config, threading.Event(), lambda _kind, _payload: None)
     semaphore = asyncio.Semaphore(4)
     connector = aiohttp.TCPConnector(limit=4, limit_per_host=4, ttl_dns_cache=300, resolver=PublicResolver())
@@ -892,14 +953,29 @@ async def fetch_preview_covers(
                             data = await read_image_response(response)
                             if not SecurityGuard.has_safe_image_signature(data[:32]):
                                 continue
-                            thumbnail = await asyncio.to_thread(encode_thumbnail_ppm, data, (132, 118))
+                            thumbnail = await asyncio.to_thread(encode_thumbnail_ppm, data, thumbnail_size)
                             on_item(character, PreviewImage(character, situation, url, thumbnail_ppm=thumbnail))
                             return
                     except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
                         continue
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
-        await asyncio.gather(*(one(session, character) for character in config.expand_characters()))
+        await asyncio.gather(*(one(session, character) for character in characters))
+
+
+def favorite_cover_fingerprint(favorite: FavoritePreset) -> str:
+    """Stable cache key for a favorite's cover strip (not name-based)."""
+    raw = "\n".join(
+        (
+            favorite.template_url,
+            favorite.character,
+            favorite.ranges,
+            favorite.outfit,
+            favorite.referer_mode,
+            favorite.referer or "",
+        )
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 class Downloader:
     def __init__(self, config: DownloadConfig, cancelled: threading.Event, notify: Callable[[str, object], None]):
@@ -1339,6 +1415,15 @@ class DownloaderApp(ctk.CTk):
         self.update_checking = False
         self.favorites, self.favorite_rejected_count, self.favorite_load_error = load_favorites()
         self.editing_favorite_name: str | None = None
+        self._font_cache: dict[tuple[int, str], ctk.CTkFont] = {}
+        self.favorite_render_token = 0
+        self.favorite_render_queue: list[tuple[int, FavoritePreset]] = []
+        self.favorite_filter_cache_key: tuple[object, ...] | None = None
+        self.favorite_filter_cache: list[FavoritePreset] = []
+        self.favorite_cover_sequence = 0
+        self.favorite_cover_cancel = threading.Event()
+        self.favorite_cover_targets: dict[str, list[tk.Label]] = {}
+        self.favorite_cover_photos: list[tk.PhotoImage] = []
         self._build()
         if self.favorite_rejected_count:
             self._write_log(
@@ -1371,7 +1456,45 @@ class DownloaderApp(ctk.CTk):
             )
 
     def _font(self, size: int, weight: str = "normal") -> ctk.CTkFont:
-        return ctk.CTkFont(family="Segoe UI Variable", size=size, weight=weight)
+        key = (size, weight)
+        font = self._font_cache.get(key)
+        if font is None:
+            font = ctk.CTkFont(family="Segoe UI Variable", size=size, weight=weight)
+            self._font_cache[key] = font
+        return font
+
+    def _center_window(self, window: ctk.CTkToplevel, width: int, height: int) -> None:
+        """Place a dialog over the main window instead of an arbitrary screen corner."""
+        self.update_idletasks()
+        root_x = self.winfo_rootx()
+        root_y = self.winfo_rooty()
+        root_w = max(self.winfo_width(), 1)
+        root_h = max(self.winfo_height(), 1)
+        x = root_x + max(0, (root_w - width) // 2)
+        y = root_y + max(0, (root_h - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _raise_toplevel(
+        self,
+        window: ctk.CTkToplevel,
+        *,
+        relative: ctk.CTkToplevel | None = None,
+    ) -> None:
+        """Keep secondary windows above their parent (fixes viewer going behind gallery)."""
+        try:
+            if relative is not None and relative.winfo_exists():
+                window.transient(relative)
+            else:
+                window.transient(self)
+            window.lift()
+            window.attributes("-topmost", True)
+            window.focus_force()
+            window.after(
+                180,
+                lambda w=window: w.attributes("-topmost", False) if w.winfo_exists() else None,
+            )
+        except tk.TclError:
+            pass
 
     def _card(self, parent: ctk.CTkBaseClass) -> ctk.CTkFrame:
         return ctk.CTkFrame(parent, corner_radius=24, fg_color=self.COLORS["surface"], border_width=1, border_color="#26314E")
@@ -1406,7 +1529,7 @@ class DownloaderApp(ctk.CTk):
         self.update_status = ctk.CTkLabel(sidebar, text="", font=self._font(9), text_color=self.COLORS["muted"], wraplength=140, justify="left")
         self.update_status.pack(side="bottom", anchor="w", padx=22, pady=(2, 0))
         self.update_button = ctk.CTkButton(
-            sidebar, text="↻  업데이트 확인", width=142, height=32, corner_radius=11,
+            sidebar, text="↻  버전 관리", width=142, height=32, corner_radius=11,
             fg_color="#273450", hover_color="#334364", font=self._font(10, "bold"),
             command=self._check_for_updates,
         )
@@ -1561,22 +1684,68 @@ class DownloaderApp(ctk.CTk):
         if is_favorites:
             self.download_view.grid_remove()
             self.favorites_view.grid()
-            self._render_favorites()
+            # Switch chrome immediately; defer heavy card builds to the next UI ticks.
+            self._show_favorites_loading_placeholder()
+            self._schedule_favorite_render(reset_page=False, delay_ms=1)
         else:
+            self.favorite_render_token += 1
             self.favorites_view.grid_remove()
             self.download_view.grid()
         self.download_nav_button.configure(fg_color="transparent" if is_favorites else self.COLORS["accent"])
         self.favorites_nav_button.configure(fg_color=self.COLORS["accent"] if is_favorites else "transparent")
 
-    def _schedule_favorite_render(self, _event: object | None = None) -> None:
-        self.favorite_page = 0
+    def _show_favorites_loading_placeholder(self) -> None:
+        if not hasattr(self, "favorite_grid"):
+            return
+        for child in self.favorite_grid.winfo_children():
+            child.destroy()
+        ctk.CTkLabel(
+            self.favorite_grid,
+            text="즐겨찾기 목록을 준비하는 중…",
+            justify="center",
+            font=self._font(12),
+            text_color="#7180A5",
+        ).grid(row=0, column=0, columnspan=2, padx=20, pady=70)
+
+    def _schedule_favorite_render(
+        self,
+        _event: object | None = None,
+        *,
+        reset_page: bool = True,
+        delay_ms: int = 90,
+    ) -> None:
+        if reset_page:
+            self.favorite_page = 0
         if self.favorite_render_after_id:
             self.after_cancel(self.favorite_render_after_id)
-        self.favorite_render_after_id = self.after(90, self._render_favorites)
+        self.favorite_render_after_id = self.after(delay_ms, self._render_favorites)
 
     def _change_favorite_page(self, offset: int) -> None:
         self.favorite_page = max(0, self.favorite_page + offset)
-        self._render_favorites()
+        self._schedule_favorite_render(reset_page=False, delay_ms=1)
+
+    def _filtered_favorites(self) -> list[FavoritePreset]:
+        query = self.favorite_search_var.get().strip().casefold()
+        cache_key = (id(self.favorites), len(self.favorites), query)
+        if self.favorite_filter_cache_key == cache_key:
+            return self.favorite_filter_cache
+        if not query:
+            filtered = list(self.favorites)
+        else:
+            filtered = [
+                favorite for favorite in self.favorites
+                if query in " ".join((
+                    favorite.name,
+                    favorite.template_url,
+                    favorite.character,
+                    favorite.ranges,
+                    favorite.referer_mode,
+                    favorite.referer or "",
+                )).casefold()
+            ]
+        self.favorite_filter_cache_key = cache_key
+        self.favorite_filter_cache = filtered
+        return filtered
 
     def _edit_favorite(self, favorite: FavoritePreset) -> None:
         self._apply_favorite(favorite)
@@ -1603,57 +1772,231 @@ class DownloaderApp(ctk.CTk):
         if self.update_checking:
             return
         self.update_checking = True
-        self.update_button.configure(state="disabled", text="확인 중…")
-        self.update_status.configure(text="GitHub 릴리스 확인 중…", text_color=self.COLORS["muted"])
+        self.update_button.configure(state="disabled", text="불러오는 중…")
+        self.update_status.configure(text="GitHub 릴리스 목록 확인 중…", text_color=self.COLORS["muted"])
         self._start_worker(self._update_worker, name="update-check")
 
     def _update_worker(self) -> None:
         try:
-            info = asyncio.run(fetch_latest_release())
-            self.events.put(("update_result", info))
+            releases = asyncio.run(fetch_release_catalog())
+            self.events.put(("release_catalog", releases))
         except Exception as error:
             self.events.put(("update_error", str(error)))
 
-    def _handle_update_result(self, info: UpdateInfo) -> None:
+    def _handle_release_catalog(self, releases: list[UpdateInfo]) -> None:
         self.update_checking = False
-        self.update_button.configure(state="normal", text="↻  업데이트 확인")
+        self.update_button.configure(state="normal", text="↻  버전 관리")
         current = parse_release_version(APP_VERSION)
         if current is None:
             self.update_status.configure(text="현재 버전 확인 불가", text_color=self.COLORS["danger"])
             return
-        if info.version > current:
-            self.update_status.configure(text=f"새 버전 {info.tag_name}", text_color=self.COLORS["success"])
-            self._show_update_dialog(info)
-        elif info.version == current:
+        latest = releases[0]
+        if latest.version > current:
+            self.update_status.configure(text=f"새 버전 {latest.tag_name}", text_color=self.COLORS["success"])
+        elif latest.version == current:
             self.update_status.configure(text="현재 최신 버전입니다.", text_color=self.COLORS["success"])
         else:
-            self.update_status.configure(text=f"개발 버전 · 공개 {info.tag_name}", text_color=self.COLORS["muted"])
+            self.update_status.configure(text=f"개발 버전 · 공개 {latest.tag_name}", text_color=self.COLORS["muted"])
+        self._show_version_browser(releases)
 
     def _handle_update_error(self, message: str) -> None:
         self.update_checking = False
-        self.update_button.configure(state="normal", text="↻  업데이트 확인")
-        self.update_status.configure(text="업데이트 확인 실패", text_color=self.COLORS["danger"])
-        self._write_log(f"업데이트 확인 실패: {message}")
+        self.update_button.configure(state="normal", text="↻  버전 관리")
+        self.update_status.configure(text="버전 목록 확인 실패", text_color=self.COLORS["danger"])
+        self._write_log(f"버전 목록 확인 실패: {message}")
+
+    def _install_action_label(self, info: UpdateInfo) -> str:
+        current = parse_release_version(APP_VERSION)
+        if current is None:
+            return "설치"
+        if info.version > current:
+            return "업데이트"
+        if info.version < current:
+            return "다운그레이드"
+        return "재설치"
+
+    def _show_version_browser(self, releases: list[UpdateInfo]) -> None:
+        """Scrollable catalog of published installers for upgrade or safe rollback."""
+        if dialog := getattr(self, "version_browser", None):
+            if dialog.winfo_exists():
+                dialog.destroy()
+        dialog = ctk.CTkToplevel(self)
+        self.version_browser = dialog
+        dialog.title("Luma Fetch — 버전 관리")
+        dialog.configure(fg_color=self.COLORS["bg"])
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, True)
+        self._center_window(dialog, 560, 620)
+        current = parse_release_version(APP_VERSION)
+        ctk.CTkLabel(
+            dialog,
+            text="버전 관리",
+            font=self._font(20, "bold"),
+            text_color=self.COLORS["text"],
+        ).pack(anchor="w", padx=22, pady=(20, 2))
+        ctk.CTkLabel(
+            dialog,
+            text=(
+                f"현재 v{APP_VERSION} · 공개 릴리스 {len(releases)}개\n"
+                "문제가 있는 버전은 아래로 내려 이전 설치 파일로 되돌릴 수 있습니다."
+            ),
+            font=self._font(11),
+            text_color=self.COLORS["muted"],
+            justify="left",
+        ).pack(anchor="w", padx=22, pady=(0, 12))
+        scroller = ctk.CTkScrollableFrame(
+            dialog,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        scroller.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        scroller.grid_columnconfigure(0, weight=1)
+        for index, info in enumerate(releases):
+            card = ctk.CTkFrame(
+                scroller,
+                corner_radius=14,
+                fg_color=self.COLORS["surface"],
+                border_width=1,
+                border_color="#26314E",
+            )
+            card.grid(row=index, column=0, sticky="ew", padx=6, pady=5)
+            card.grid_columnconfigure(0, weight=1)
+            is_current = current is not None and info.version == current
+            badge = "현재 버전" if is_current else self._install_action_label(info)
+            if info.is_prerelease:
+                badge = f"{badge} · 사전 공개"
+            published = (info.published_at or "")[:10]
+            title_row = ctk.CTkFrame(card, fg_color="transparent")
+            title_row.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 2))
+            title_row.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(
+                title_row,
+                text=info.tag_name,
+                font=self._font(14, "bold"),
+                text_color=self.COLORS["text"],
+                anchor="w",
+            ).grid(row=0, column=0, sticky="w")
+            ctk.CTkLabel(
+                title_row,
+                text=badge,
+                font=self._font(9, "bold"),
+                text_color=self.COLORS["success"] if is_current else self.COLORS["accent"],
+            ).grid(row=0, column=1, sticky="e")
+            meta = info.title
+            if published:
+                meta = f"{meta}  ·  {published}"
+            meta = f"{meta}  ·  {info.asset_size / (1024 * 1024):.1f} MiB"
+            ctk.CTkLabel(
+                card,
+                text=meta,
+                font=self._font(10),
+                text_color=self.COLORS["muted"],
+                anchor="w",
+            ).grid(row=1, column=0, sticky="ew", padx=12)
+            note_preview = (info.notes or "릴리스 노트가 없습니다.").splitlines()
+            note_preview = " ".join(line.strip() for line in note_preview if line.strip())[:160]
+            ctk.CTkLabel(
+                card,
+                text=note_preview,
+                font=self._font(10),
+                text_color="#AAB7D8",
+                anchor="w",
+                justify="left",
+                wraplength=480,
+            ).grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 8))
+            actions = ctk.CTkFrame(card, fg_color="transparent")
+            actions.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
+            ctk.CTkButton(
+                actions,
+                text="릴리스 보기",
+                width=96,
+                height=30,
+                corner_radius=10,
+                fg_color="transparent",
+                border_width=1,
+                border_color="#425274",
+                font=self._font(9, "bold"),
+                command=lambda value=info: self._open_release_page(value.release_url),
+            ).pack(side="left")
+            action_label = self._install_action_label(info)
+            ctk.CTkButton(
+                actions,
+                text=action_label if not is_current else "재설치",
+                width=110,
+                height=30,
+                corner_radius=10,
+                fg_color=self.COLORS["accent"],
+                hover_color=self.COLORS["accent_hover"],
+                font=self._font(9, "bold"),
+                command=lambda value=info: self._confirm_and_install_release(value),
+            ).pack(side="right")
+        footer = ctk.CTkFrame(dialog, fg_color="transparent")
+        footer.pack(fill="x", padx=22, pady=(0, 18))
+        ctk.CTkButton(
+            footer,
+            text="닫기",
+            width=90,
+            height=34,
+            corner_radius=11,
+            fg_color="#273450",
+            hover_color="#334364",
+            command=dialog.destroy,
+        ).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        self._raise_toplevel(dialog)
+
+    def _confirm_and_install_release(self, info: UpdateInfo) -> None:
+        from tkinter import messagebox
+
+        action = self._install_action_label(info)
+        current = parse_release_version(APP_VERSION)
+        if current is not None and info.version < current:
+            detail = (
+                f"현재 v{APP_VERSION}에서 {info.tag_name}(으)로 다운그레이드합니다.\n"
+                "설치 전 앱이 종료되며, 설정/즐겨찾기는 유지됩니다."
+            )
+        elif current is not None and info.version > current:
+            detail = f"현재 v{APP_VERSION}에서 {info.tag_name}(으)로 업데이트합니다."
+        else:
+            detail = f"{info.tag_name} 설치 파일을 다시 설치합니다."
+        if not messagebox.askyesno(
+            f"{action} 확인",
+            f"{detail}\n\n계속할까요?",
+            parent=self,
+        ):
+            return
+        if browser := getattr(self, "version_browser", None):
+            if browser.winfo_exists():
+                browser.grab_release()
+                browser.destroy()
+        self._show_update_dialog(info)
 
     def _show_update_dialog(self, info: UpdateInfo) -> None:
         if dialog := getattr(self, "update_dialog", None):
             if dialog.winfo_exists():
                 dialog.destroy()
+        action = self._install_action_label(info)
         self.update_dialog = ctk.CTkToplevel(self)
-        self.update_dialog.title("Luma Fetch — 새 업데이트")
-        self.update_dialog.geometry("540x540")
-        self.update_dialog.resizable(False, False)
+        self.update_dialog.title(f"Luma Fetch — {action}")
         self.update_dialog.configure(fg_color=self.COLORS["bg"])
+        self.update_dialog.resizable(False, False)
         self.update_dialog.transient(self)
         self.update_dialog.grab_set()
+        self._center_window(self.update_dialog, 540, 540)
         self.update_download_cancel = threading.Event()
+        heading = {
+            "업데이트": "새 버전을 설치합니다",
+            "다운그레이드": "이전 버전으로 되돌립니다",
+            "재설치": "같은 버전을 다시 설치합니다",
+        }.get(action, "선택한 버전을 설치합니다")
         ctk.CTkLabel(
-            self.update_dialog, text="새 버전을 사용할 수 있습니다",
+            self.update_dialog, text=heading,
             font=self._font(20, "bold"), text_color=self.COLORS["text"],
         ).pack(anchor="w", padx=24, pady=(24, 4))
         ctk.CTkLabel(
             self.update_dialog,
-            text=f"현재 v{APP_VERSION}  →  최신 {info.tag_name}\n{info.title}",
+            text=f"현재 v{APP_VERSION}  →  대상 {info.tag_name}\n{info.title}",
             font=self._font(12), text_color=self.COLORS["muted"], justify="left",
         ).pack(anchor="w", padx=24, pady=(0, 14))
         notes = ctk.CTkTextbox(
@@ -1693,12 +2036,12 @@ class DownloaderApp(ctk.CTk):
         actions = ctk.CTkFrame(self.update_dialog, fg_color="transparent")
         actions.pack(fill="x", padx=24, pady=(0, 22))
         self.update_cancel_button = ctk.CTkButton(
-            actions, text="나중에", width=90, height=36, corner_radius=12,
+            actions, text="취소", width=90, height=36, corner_radius=12,
             fg_color="#273450", hover_color="#334364", command=self._cancel_update_download,
         )
         self.update_cancel_button.pack(side="right")
         self.update_install_button = ctk.CTkButton(
-            actions, text="지금 업데이트", width=145, height=36, corner_radius=12,
+            actions, text=f"지금 {action}", width=145, height=36, corner_radius=12,
             fg_color=self.COLORS["accent"], hover_color=self.COLORS["accent_hover"],
             command=lambda: self._download_and_install_update(info),
         )
@@ -1709,6 +2052,7 @@ class DownloaderApp(ctk.CTk):
             command=lambda: self._open_release_page(info.release_url),
         ).pack(side="left")
         self.update_dialog.protocol("WM_DELETE_WINDOW", self._cancel_update_download)
+        self._raise_toplevel(self.update_dialog)
 
     def _download_and_install_update(self, info: UpdateInfo) -> None:
         self.update_download_cancel = threading.Event()
@@ -2093,7 +2437,7 @@ class DownloaderApp(ctk.CTk):
     def _open_preview_selector(self, config: DownloadConfig) -> None:
         self._ensure_preview_gallery()
         self.preview_gallery.deiconify()
-        self.preview_gallery.lift()
+        self._raise_toplevel(self.preview_gallery)
         self.virtual_gallery.grid_remove()
         self.gallery_frame.grid()
         self.virtual_gallery.clear()
@@ -2402,8 +2746,9 @@ class DownloaderApp(ctk.CTk):
         self.viewer_mode = "fit"
         self._sync_viewer_mode_buttons()
         self.original_viewer.deiconify()
-        self.original_viewer.lift()
-        self.original_viewer.focus_force()
+        gallery = getattr(self, "preview_gallery", None)
+        relative = gallery if gallery is not None and gallery.winfo_exists() else None
+        self._raise_toplevel(self.original_viewer, relative=relative)
         self._show_original_at_position()
 
     def _navigate_original(self, step: int) -> None:
@@ -2535,24 +2880,26 @@ class DownloaderApp(ctk.CTk):
                 f"원본 {original_size[0]}×{original_size[1]}  ·  {mode_text} {self.viewer_current_scale:.0%}  ·  휠 확대/축소"
             )
         )
+        gallery = getattr(self, "preview_gallery", None)
+        relative = gallery if gallery is not None and gallery.winfo_exists() else None
+        self._raise_toplevel(self.original_viewer, relative=relative)
     def _render_favorites(self) -> None:
         if not hasattr(self, "favorite_grid"):
             return
         self.favorite_render_after_id = None
-        query = self.favorite_search_var.get().strip().casefold()
-        filtered = [
-            favorite for favorite in self.favorites
-            if not query or query in " ".join((
-                favorite.name, favorite.template_url, favorite.character,
-                favorite.ranges, favorite.referer_mode, favorite.referer or "",
-            )).casefold()
-        ]
+        self.favorite_render_token += 1
+        token = self.favorite_render_token
+        self._cancel_favorite_cover_loads()
+        query = self.favorite_search_var.get().strip()
+        filtered = self._filtered_favorites()
         page_count = max(1, (len(filtered) + FAVORITES_PAGE_SIZE - 1) // FAVORITES_PAGE_SIZE)
         self.favorite_page = min(self.favorite_page, page_count - 1)
         first = self.favorite_page * FAVORITES_PAGE_SIZE
         visible = filtered[first:first + FAVORITES_PAGE_SIZE]
         for child in self.favorite_grid.winfo_children():
             child.destroy()
+        self.favorite_cover_targets.clear()
+        self.favorite_cover_photos.clear()
         self.favorite_count_label.configure(text=f"전체 {len(self.favorites):,}개 · 검색 결과 {len(filtered):,}개")
         self.favorite_page_label.configure(text=f"{self.favorite_page + 1} / {page_count}")
         self.favorite_prev_button.configure(state="normal" if self.favorite_page > 0 else "disabled")
@@ -2560,25 +2907,289 @@ class DownloaderApp(ctk.CTk):
         self.favorites_nav_button.configure(text=f"★  즐겨찾기  {len(self.favorites):,}")
         if not visible:
             message = "검색 결과가 없습니다." if query else "저장된 즐겨찾기가 없습니다.\n다운로드 화면에서 현재 설정을 즐겨찾기로 저장하세요."
-            ctk.CTkLabel(self.favorite_grid, text=message, justify="center", font=self._font(12), text_color="#7180A5").grid(row=0, column=0, columnspan=2, padx=20, pady=70)
+            ctk.CTkLabel(
+                self.favorite_grid,
+                text=message,
+                justify="center",
+                font=self._font(12),
+                text_color="#7180A5",
+            ).grid(row=0, column=0, columnspan=2, padx=20, pady=70)
             return
-        for index, favorite in enumerate(visible):
-            card = ctk.CTkFrame(self.favorite_grid, corner_radius=16, fg_color=self.COLORS["surface"], border_width=1, border_color="#26314E")
-            card.grid(row=index // 2, column=index % 2, padx=7, pady=7, sticky="nsew")
-            card.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="favorite_action")
-            ctk.CTkButton(
-                card, text=favorite.name, anchor="w", height=32, corner_radius=9,
-                fg_color="transparent", hover_color="#273450", font=self._font(12, "bold"),
-                command=lambda value=favorite: self._preview_favorite(value),
-            ).grid(row=0, column=0, columnspan=4, padx=10, pady=(9, 2), sticky="ew")
-            host = urlparse(favorite.template_url).netloc
-            ctk.CTkLabel(card, text=host, anchor="w", font=self._font(9, "bold"), text_color=self.COLORS["accent"]).grid(row=1, column=0, columnspan=4, padx=13, sticky="ew")
-            details = f"캐릭터  {favorite.character}   ·   범위  {favorite.ranges}"
-            ctk.CTkLabel(card, text=details, anchor="w", justify="left", wraplength=320, font=self._font(10), text_color="#AAB7D8").grid(row=2, column=0, columnspan=4, padx=13, pady=(2, 8), sticky="ew")
-            ctk.CTkButton(card, text="미리보기", height=29, corner_radius=9, fg_color=self.COLORS["accent"], hover_color=self.COLORS["accent_hover"], font=self._font(9, "bold"), command=lambda value=favorite: self._preview_favorite(value)).grid(row=3, column=0, padx=(10, 4), pady=(0, 10), sticky="ew")
-            ctk.CTkButton(card, text="다운로드", height=29, corner_radius=9, fg_color="#273450", hover_color="#334364", font=self._font(9, "bold"), command=lambda value=favorite: self._download_favorite(value)).grid(row=3, column=1, padx=4, pady=(0, 10), sticky="ew")
-            ctk.CTkButton(card, text="수정", height=29, corner_radius=9, fg_color="#273450", hover_color="#334364", font=self._font(9), command=lambda value=favorite: self._edit_favorite(value)).grid(row=3, column=2, padx=4, pady=(0, 10), sticky="ew")
-            ctk.CTkButton(card, text="삭제", width=48, height=29, corner_radius=9, fg_color="#342133", hover_color="#49283C", text_color="#FFB3C0", font=self._font(9), command=lambda value=favorite: self._delete_favorite(value)).grid(row=3, column=3, padx=(4, 10), pady=(0, 10))
+        # Build cards in small batches so opening the page stays responsive.
+        self.favorite_render_queue = list(enumerate(visible))
+        self._favorite_render_visible = list(visible)
+        self._render_favorite_card_batch(token)
+
+    def _render_favorite_card_batch(self, token: int) -> None:
+        if token != self.favorite_render_token or not hasattr(self, "favorite_grid"):
+            return
+        batch = self.favorite_render_queue[:FAVORITE_CARD_BATCH_SIZE]
+        del self.favorite_render_queue[:FAVORITE_CARD_BATCH_SIZE]
+        for index, favorite in batch:
+            self._build_favorite_card(index, favorite)
+        if self.favorite_render_queue:
+            self.after(1, lambda: self._render_favorite_card_batch(token))
+            return
+        # After cards exist, fill cover strips (disk cache first, then network).
+        self._start_favorite_cover_loads(getattr(self, "_favorite_render_visible", []), token)
+
+    def _build_favorite_card(self, index: int, favorite: FavoritePreset) -> None:
+        card = ctk.CTkFrame(
+            self.favorite_grid,
+            corner_radius=16,
+            fg_color=self.COLORS["surface"],
+            border_width=1,
+            border_color="#26314E",
+        )
+        card.grid(row=index // 2, column=index % 2, padx=7, pady=7, sticky="nsew")
+        card.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="favorite_action")
+        title_font = self._font(12, "bold")
+        host_font = self._font(9, "bold")
+        body_font = self._font(10)
+        action_font = self._font(9, "bold")
+        plain_font = self._font(9)
+        ctk.CTkButton(
+            card,
+            text=favorite.name,
+            anchor="w",
+            height=32,
+            corner_radius=9,
+            fg_color="transparent",
+            hover_color="#273450",
+            font=title_font,
+            command=lambda value=favorite: self._preview_favorite(value),
+        ).grid(row=0, column=0, columnspan=4, padx=10, pady=(9, 2), sticky="ew")
+        host = urlparse(favorite.template_url).netloc
+        ctk.CTkLabel(
+            card,
+            text=host,
+            anchor="w",
+            font=host_font,
+            text_color=self.COLORS["accent"],
+        ).grid(row=1, column=0, columnspan=4, padx=13, sticky="ew")
+        cover_row = ctk.CTkFrame(card, fg_color="transparent", height=70)
+        cover_row.grid(row=2, column=0, columnspan=4, padx=10, pady=(4, 2), sticky="ew")
+        cover_row.grid_propagate(False)
+        slots: list[tk.Label] = []
+        for slot_index in range(FAVORITE_COVER_LIMIT):
+            slot = tk.Label(
+                cover_row,
+                text="·",
+                width=9,
+                height=3,
+                bg="#0D1528",
+                fg="#5F6E92",
+                bd=0,
+                highlightthickness=1,
+                highlightbackground="#26314E",
+                font=("Segoe UI Variable", 9),
+            )
+            slot.pack(side="left", padx=(0 if slot_index == 0 else 4, 0), pady=2)
+            slot.bind("<Button-1>", lambda _event, value=favorite: self._preview_favorite(value))
+            slots.append(slot)
+        fingerprint = favorite_cover_fingerprint(favorite)
+        self.favorite_cover_targets[fingerprint] = slots
+        details = f"캐릭터  {favorite.character}   ·   범위  {favorite.ranges}"
+        ctk.CTkLabel(
+            card,
+            text=details,
+            anchor="w",
+            justify="left",
+            wraplength=320,
+            font=body_font,
+            text_color="#AAB7D8",
+        ).grid(row=3, column=0, columnspan=4, padx=13, pady=(2, 8), sticky="ew")
+        ctk.CTkButton(
+            card,
+            text="미리보기",
+            height=29,
+            corner_radius=9,
+            fg_color=self.COLORS["accent"],
+            hover_color=self.COLORS["accent_hover"],
+            font=action_font,
+            command=lambda value=favorite: self._preview_favorite(value),
+        ).grid(row=4, column=0, padx=(10, 4), pady=(0, 10), sticky="ew")
+        ctk.CTkButton(
+            card,
+            text="다운로드",
+            height=29,
+            corner_radius=9,
+            fg_color="#273450",
+            hover_color="#334364",
+            font=action_font,
+            command=lambda value=favorite: self._download_favorite(value),
+        ).grid(row=4, column=1, padx=4, pady=(0, 10), sticky="ew")
+        ctk.CTkButton(
+            card,
+            text="수정",
+            height=29,
+            corner_radius=9,
+            fg_color="#273450",
+            hover_color="#334364",
+            font=plain_font,
+            command=lambda value=favorite: self._edit_favorite(value),
+        ).grid(row=4, column=2, padx=4, pady=(0, 10), sticky="ew")
+        ctk.CTkButton(
+            card,
+            text="삭제",
+            width=48,
+            height=29,
+            corner_radius=9,
+            fg_color="#342133",
+            hover_color="#49283C",
+            text_color="#FFB3C0",
+            font=plain_font,
+            command=lambda value=favorite: self._delete_favorite(value),
+        ).grid(row=4, column=3, padx=(4, 10), pady=(0, 10))
+
+    def _cancel_favorite_cover_loads(self) -> None:
+        self.favorite_cover_cancel.set()
+        self.favorite_cover_sequence += 1
+
+    def _favorite_cover_cache_dir(self, fingerprint: str) -> Path:
+        return FAVORITE_COVER_CACHE_DIR / fingerprint
+
+    def _read_favorite_cover_cache(self, fingerprint: str) -> dict[int, bytes]:
+        folder = self._favorite_cover_cache_dir(fingerprint)
+        if not folder.is_dir():
+            return {}
+        cached: dict[int, bytes] = {}
+        for index in range(FAVORITE_COVER_LIMIT):
+            path = folder / f"{index}.ppm"
+            if path.is_file():
+                try:
+                    data = path.read_bytes()
+                    if data.startswith(b"P6"):
+                        cached[index] = data
+                except OSError:
+                    continue
+        return cached
+
+    def _write_favorite_cover_cache(self, fingerprint: str, index: int, ppm: bytes) -> None:
+        if index < 0 or index >= FAVORITE_COVER_LIMIT or not ppm:
+            return
+        folder = self._favorite_cover_cache_dir(fingerprint)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / f"{index}.ppm"
+            temporary = target.with_suffix(".ppm.part")
+            temporary.write_bytes(ppm)
+            os.replace(temporary, target)
+        except OSError:
+            pass
+
+    def _apply_favorite_cover_image(
+        self,
+        fingerprint: str,
+        slot_index: int,
+        ppm: bytes,
+        *,
+        character: str = "",
+    ) -> None:
+        slots = self.favorite_cover_targets.get(fingerprint)
+        if not slots or slot_index < 0 or slot_index >= len(slots):
+            return
+        try:
+            photo = tk.PhotoImage(data=ppm, format="PPM")
+        except tk.TclError:
+            return
+        self.favorite_cover_photos.append(photo)
+        slot = slots[slot_index]
+        try:
+            if not slot.winfo_exists():
+                return
+            slot.configure(image=photo, text="", width=FAVORITE_COVER_SIZE[0], height=FAVORITE_COVER_SIZE[1])
+            slot.image = photo
+            if character:
+                slot.configure(cursor="hand2")
+        except tk.TclError:
+            return
+
+    def _start_favorite_cover_loads(self, favorites: list[FavoritePreset], token: int) -> None:
+        if token != self.favorite_render_token or not favorites:
+            return
+        self.favorite_cover_cancel = threading.Event()
+        self.favorite_cover_sequence += 1
+        sequence = self.favorite_cover_sequence
+        pending: list[FavoritePreset] = []
+        for favorite in favorites:
+            fingerprint = favorite_cover_fingerprint(favorite)
+            cached = self._read_favorite_cover_cache(fingerprint)
+            for slot_index, ppm in cached.items():
+                self._apply_favorite_cover_image(fingerprint, slot_index, ppm)
+            if len(cached) < min(FAVORITE_COVER_LIMIT, max(1, len(favorite.character.split(",")))):
+                # Still try network for missing slots (expanded count decided in worker).
+                if len(cached) < FAVORITE_COVER_LIMIT:
+                    pending.append(favorite)
+        if pending:
+            self._start_worker(
+                self._favorite_covers_worker,
+                args=(pending, sequence, token, self.favorite_cover_cancel),
+                name=f"favorite-covers-{sequence}",
+            )
+
+    def _favorite_covers_worker(
+        self,
+        favorites: list[FavoritePreset],
+        sequence: int,
+        token: int,
+        cancelled: threading.Event,
+    ) -> None:
+        for favorite in favorites:
+            if cancelled.is_set() or self._closing:
+                return
+            fingerprint = favorite_cover_fingerprint(favorite)
+            cached = self._read_favorite_cover_cache(fingerprint)
+            if len(cached) >= FAVORITE_COVER_LIMIT:
+                continue
+            try:
+                config = DownloadConfig(
+                    template_url=favorite.template_url,
+                    character=favorite.character,
+                    ranges=favorite.ranges,
+                    outfit=favorite.outfit,
+                    referer_mode=favorite.referer_mode,
+                    referer=favorite.referer if favorite.referer_mode == "manual" else None,
+                    destination=Path.cwd(),
+                    separate_character_folders=favorite.separate_character_folders,
+                    scan_with_defender=False,
+                    concurrency=4,
+                    retries=1,
+                )
+                characters = config.expand_characters()[:FAVORITE_COVER_LIMIT]
+                if not characters:
+                    continue
+                # Narrow character list so only the first few covers are fetched.
+                probe_config = config.model_copy(update={"character": ",".join(characters)})
+                slot_by_character = {name: index for index, name in enumerate(characters)}
+
+                def on_cover(character: str, item: PreviewImage, *, fp: str = fingerprint) -> None:
+                    if cancelled.is_set() or item.thumbnail_ppm is None:
+                        return
+                    slot_index = slot_by_character.get(character)
+                    if slot_index is None:
+                        return
+                    self._write_favorite_cover_cache(fp, slot_index, item.thumbnail_ppm)
+                    self.events.put(
+                        (
+                            "favorite_cover_item",
+                            (sequence, token, fp, slot_index, character, item.thumbnail_ppm),
+                        )
+                    )
+
+                asyncio.run(
+                    fetch_preview_covers(
+                        probe_config,
+                        on_cover,
+                        cancelled,
+                        max_characters=FAVORITE_COVER_LIMIT,
+                        max_situation_probes=FAVORITE_COVER_SITUATION_PROBES,
+                        thumbnail_size=FAVORITE_COVER_SIZE,
+                    )
+                )
+            except Exception:
+                # Cover strip is best-effort reference UI; never block favorites.
+                continue
 
     def _apply_favorite(self, favorite: FavoritePreset) -> None:
         self._cancel_preview_update()
@@ -2632,8 +3243,8 @@ class DownloaderApp(ctk.CTk):
         if editing:
             name = editing.name
         else:
-            dialog = ctk.CTkInputDialog(text="즐겨찾기 이름을 입력하세요.", title="즐겨찾기 저장")
-            if not (name := (dialog.get_input() or "").strip()):
+            name = self._prompt_favorite_name()
+            if not name:
                 return
         fixed_destination = self.fixed_destination_var.get()
         destination = self.folder_var.get().strip() or None
@@ -2678,10 +3289,83 @@ class DownloaderApp(ctk.CTk):
             return
         was_editing = editing is not None
         self._cancel_favorite_edit(announce=False)
-        self._render_favorites()
+        self.favorite_filter_cache_key = None
+        self._schedule_favorite_render(reset_page=False, delay_ms=1)
         action = "수정" if was_editing else "저장"
         self._clear_live_preview(f"즐겨찾기 {action} 완료 · {preset.name}")
         self._write_log(f"즐겨찾기 {action} 완료: {preset.name}")
+
+    def _prompt_favorite_name(self) -> str | None:
+        """Name dialog centered on the main window (not a random screen corner)."""
+        result: list[str | None] = [None]
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("즐겨찾기 저장")
+        dialog.configure(fg_color=self.COLORS["bg"])
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+        self._center_window(dialog, 420, 190)
+        ctk.CTkLabel(
+            dialog,
+            text="즐겨찾기 이름",
+            font=self._font(16, "bold"),
+            text_color=self.COLORS["text"],
+        ).pack(anchor="w", padx=22, pady=(20, 6))
+        ctk.CTkLabel(
+            dialog,
+            text="목록에서 바로 찾을 수 있는 짧은 이름을 입력하세요.",
+            font=self._font(10),
+            text_color=self.COLORS["muted"],
+        ).pack(anchor="w", padx=22, pady=(0, 10))
+        name_var = ctk.StringVar(value="")
+        entry = ctk.CTkEntry(
+            dialog,
+            textvariable=name_var,
+            height=36,
+            corner_radius=11,
+            fg_color=self.COLORS["input"],
+            border_color="#2A3655",
+            font=self._font(12),
+            placeholder_text="예: BabeChat 기본 세트",
+        )
+        entry.pack(fill="x", padx=22, pady=(0, 14))
+        actions = ctk.CTkFrame(dialog, fg_color="transparent")
+        actions.pack(fill="x", padx=22, pady=(0, 18))
+
+        def accept(_event: object | None = None) -> None:
+            result[0] = name_var.get().strip() or None
+            dialog.destroy()
+
+        def cancel() -> None:
+            result[0] = None
+            dialog.destroy()
+
+        ctk.CTkButton(
+            actions,
+            text="취소",
+            width=84,
+            height=34,
+            corner_radius=11,
+            fg_color="#273450",
+            hover_color="#334364",
+            command=cancel,
+        ).pack(side="right")
+        ctk.CTkButton(
+            actions,
+            text="저장",
+            width=96,
+            height=34,
+            corner_radius=11,
+            fg_color=self.COLORS["accent"],
+            hover_color=self.COLORS["accent_hover"],
+            command=accept,
+        ).pack(side="right", padx=(0, 8))
+        entry.bind("<Return>", accept)
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        self._raise_toplevel(dialog)
+        entry.focus_set()
+        dialog.wait_window()
+        return result[0]
 
     def _preview_favorite(self, favorite: FavoritePreset) -> None:
         if self.running:
@@ -2724,7 +3408,8 @@ class DownloaderApp(ctk.CTk):
         except OSError as error:
             self._write_log(f"즐겨찾기 파일 저장 실패: {error}")
             return
-        self._render_favorites()
+        self.favorite_filter_cache_key = None
+        self._schedule_favorite_render(reset_page=False, delay_ms=1)
         self._write_log(f"즐겨찾기 삭제: {favorite.name}")
     def _choose_folder(self) -> None:
         from tkinter import filedialog
@@ -2794,6 +3479,15 @@ class DownloaderApp(ctk.CTk):
                 sequence, message = payload
                 if sequence == self.preview_sequence:
                     self._write_log(f"캐릭터 첫 이미지 요청 오류: {message}")
+            elif kind == "favorite_cover_item":
+                sequence, token, fingerprint, slot_index, character, ppm = payload
+                if sequence == self.favorite_cover_sequence and token == self.favorite_render_token:
+                    self._apply_favorite_cover_image(
+                        str(fingerprint),
+                        int(slot_index),
+                        bytes(ppm),
+                        character=str(character),
+                    )
             elif kind == "live_preview_start":
                 sequence, character, total = payload
                 if sequence == self.preview_sequence:
@@ -2826,9 +3520,9 @@ class DownloaderApp(ctk.CTk):
                     self.viewer_canvas.delete("all")
                     self.viewer_canvas.create_text(max(1, self.viewer_canvas.winfo_width()) // 2, max(1, self.viewer_canvas.winfo_height()) // 2, text="원본 이미지를 표시할 수 없습니다.", fill="#AAB7D8", font=("Segoe UI Variable", 13))
                     self.viewer_summary.configure(text=f"{item.character} / {item.situation} · {message}")
-            elif kind == "update_result":
-                assert isinstance(payload, UpdateInfo)
-                self._handle_update_result(payload)
+            elif kind == "release_catalog":
+                assert isinstance(payload, list)
+                self._handle_release_catalog(payload)
             elif kind == "update_error":
                 self._handle_update_error(str(payload))
             elif kind == "update_download_progress":

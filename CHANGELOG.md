@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.13.2 — 2026-07-24
+
+### Added
+
+- **버전 관리** panel lists every published GitHub release in a scroll view and supports update, reinstall, or **downgrade** with the same trusted installer pipeline.
+- Custom favorite-name dialog centered over the main window.
+- Favorites cards show up to **4 character cover thumbnails** (disk-cached) for quick visual reference.
+
+### Fixed
+
+- Original image viewer no longer sinks behind the preview gallery window.
+- Favorite-name prompt no longer appears in an arbitrary screen corner.
+- Favorites page open/render hitch reduced via deferred view switch, filter cache, font reuse, smaller page size, and batched card creation.
+
+### Changed
+
+- Sidebar control renamed to **버전 관리**.
+- Favorites page size is 20 cards with incremental rendering.
+
 ## 1.13.1 — 2026-07-24
 
 ### Changed
