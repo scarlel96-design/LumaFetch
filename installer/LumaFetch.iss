@@ -34,7 +34,6 @@ RestartApplications=no
 Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "바탕 화면에 바로가기 만들기"; GroupDescription: "추가 바로가기:"
 Name: "vcredist"; Description: "Microsoft Visual C++ 호환성 런타임 자동 설치 (없는 경우 권장)"; GroupDescription: "선행 조건:"; Flags: checkedonce; Check: IsVCRuntimeMissing
 
 [Files]
@@ -42,7 +41,8 @@ Source: "..\work\dist\LumaFetch\*"; DestDir: "{app}"; Flags: ignoreversion recur
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0; Tasks: desktopicon
+; Desktop shortcut only when none exists (manual install and in-app update).
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; IconIndex: 0; Check: NeedDesktopIcon
 
 [Code]
 var
@@ -61,6 +61,23 @@ begin
       Exit;
     end;
   end;
+end;
+
+function DesktopShortcutPath: String;
+begin
+  Result := ExpandConstant('{autodesktop}\{#MyAppName}.lnk');
+end;
+
+function DesktopShortcutExists: Boolean;
+begin
+  Result := FileExists(DesktopShortcutPath);
+end;
+
+function NeedDesktopIcon: Boolean;
+begin
+  { Create a desktop icon only when the user does not already have one.
+    Covers first install, manual reinstall, and silent /LUMAFETCHUPDATE updates. }
+  Result := not DesktopShortcutExists;
 end;
 
 function IsVCRuntimeInstalled: Boolean;

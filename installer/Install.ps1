@@ -12,10 +12,14 @@ $shortcut.Description = 'Fast image batch downloader'
 $shortcut.Save()
 $desktop = [Environment]::GetFolderPath('Desktop')
 if ($desktop) {
-    $desktopShortcut = $shell.CreateShortcut((Join-Path $desktop "$appName.lnk"))
-    $desktopShortcut.TargetPath = $shortcut.TargetPath
-    $desktopShortcut.WorkingDirectory = $installDir
-    $desktopShortcut.Description = $shortcut.Description
-    $desktopShortcut.Save()
+    $desktopLink = Join-Path $desktop "$appName.lnk"
+    # Only create a desktop icon when the user does not already have one.
+    if (-not (Test-Path -LiteralPath $desktopLink)) {
+        $desktopShortcut = $shell.CreateShortcut($desktopLink)
+        $desktopShortcut.TargetPath = $shortcut.TargetPath
+        $desktopShortcut.WorkingDirectory = $installDir
+        $desktopShortcut.Description = $shortcut.Description
+        $desktopShortcut.Save()
+    }
 }
 Start-Process -FilePath (Join-Path $installDir 'LumaFetch.exe')

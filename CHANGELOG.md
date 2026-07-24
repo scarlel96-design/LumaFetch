@@ -8,6 +8,7 @@
 - Clearer download filenames: `{character}_{outfit}_{situation}.ext`.
 - Hard cap with a clear error when total job combinations exceed 100,000.
 - Separate sidebar actions: **업데이트 확인** (latest only) and **버전 관리** (full release list only; no latest-update comparison).
+- Desktop shortcut is created only when none already exists (manual install and in-app update).
 
 ### Fixed
 
